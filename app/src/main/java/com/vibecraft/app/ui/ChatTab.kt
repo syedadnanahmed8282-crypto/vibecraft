@@ -17,9 +17,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -31,15 +31,15 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vibecraft.app.AppVm
-import com.vibecraft.app.data.MessageEntity
+import com.vibecraft.app.Step
 import kotlinx.coroutines.flow.flowOf
+import com.vibecraft.app.data.MessageEntity
 
 private val templates: List<Pair<String, ImageVector>> = listOf(
     "To-do list" to Ic.Todo, "Chat app" to Ic.Chat, "Notes" to Ic.Notes,
@@ -56,11 +56,10 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpened: (String) 
     var text by remember { mutableStateOf("") }
     val state = rememberLazyListState()
     val thinking = id != null && vm.thinkingId == id
-    LaunchedEffect(msgs.size, thinking) {
-        if (msgs.isNotEmpty()) state.animateScrollToItem(msgs.size - 1 + if (thinking) 1 else 0)
-    }
+    LaunchedEffect(msgs.size, thinking) { if (msgs.isNotEmpty()) state.animateScrollToItem(msgs.size - 1 + if (thinking) 1 else 0) }
 
     fun send(t: String) {
+        if (vm.thinkingId != null) return
         val newId = vm.send(id, t)
         if (newId != null && newId != id) onOpened(newId)
         text = ""
@@ -79,11 +78,11 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpened: (String) 
                         "assistant" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
                             val shape = RoundedCornerShape(14.dp, 14.dp, 14.dp, 4.dp)
                             Box(
-                                Modifier.widthIn(max = 320.dp).clip(shape).background(c.sf).border(1.dp, c.bd, shape)
+                                Modifier.fillMaxWidth(0.95f).clip(shape).background(c.sf).border(1.dp, c.bd, shape)
                                     .padding(horizontal = 14.dp, vertical = 10.dp),
-                            ) { Text(m.content, color = c.tx, fontSize = 14.5.sp) }
+                            ) { MarkdownText(m.content) }
                         }
-                        "note" -> Box(Modifier.fillMaxWidth(), Alignment.Center) {
+                        "note" -> if (m.content.startsWith("FILE|")) FileCard(m.content) else Box(Modifier.fillMaxWidth(), Alignment.Center) {
                             Text(
                                 m.content, color = c.ac, fontSize = 12.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center,
                                 modifier = Modifier.clip(RoundedCornerShape(999.dp)).background(c.ac2).padding(horizontal = 14.dp, vertical = 6.dp),
@@ -98,14 +97,14 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpened: (String) 
                         }
                     }
                 }
-                if (thinking) item(key = "typing") { TypingDots() }
+                if (thinking) item(key = "typing") { if (vm.steps.isEmpty()) TypingDots() else StepsCard(vm.steps) }
             }
         }
         if (vm.profiles.isEmpty()) {
             Text(
                 "Add an AI profile in Settings to get replies.", color = c.ac, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().background(c.ac2).clickable(onClick = onSetup).padding(vertical = 9.dp).testTag("setup_ai_banner"),
+                modifier = Modifier.fillMaxWidth().background(c.ac2).clickable(onClick = onSetup).padding(vertical = 9.dp),
             )
         }
         Row(
@@ -127,7 +126,7 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpened: (String) 
                 BasicTextField(
                     value = text, onValueChange = { text = it }, maxLines = 4,
                     textStyle = TextStyle(color = c.tx, fontSize = 14.sp), cursorBrush = SolidColor(c.ac),
-                    modifier = Modifier.fillMaxWidth().testTag("message_input"),
+                    modifier = Modifier.fillMaxWidth(),
                     decorationBox = { inner ->
                         Box {
                             if (text.isEmpty()) Text("Describe your app…", color = c.mu.copy(alpha = 0.7f), fontSize = 14.sp)
@@ -138,7 +137,7 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpened: (String) 
             }
             Spacer(Modifier.width(8.dp))
             Box(
-                Modifier.size(44.dp).clip(shape).background(c.g).clickable { send(text) }.testTag("send_button"),
+                Modifier.size(44.dp).clip(shape).background(c.g).clickable { send(text) },
                 Alignment.Center,
             ) { Icon(Ic.Send, "Send", Modifier.size(19.dp), tint = Color.White) }
         }
@@ -229,7 +228,57 @@ private fun TypingDots() {
                 animationSpec = infiniteRepeatable(tween(500, easing = FastOutSlowInEasing), RepeatMode.Reverse, StartOffset(i * 150)),
                 label = "dot$i",
             )
-            Box(Modifier.size(7.dp).graphicsLayer { translationY = y }.clip(CircleShape).background(c.ac))
+            Box(Modifier.size(7.dp).graphicsLayer { translationY = y }.clip(androidx.compose.foundation.shape.CircleShape).background(c.ac))
         }
+    }
+}
+
+/** Live progress while the AI works: planning, then one line per file. */
+@Composable
+private fun StepsCard(steps: List<Step>) {
+    val c = VCT.c
+    val shape = RoundedCornerShape(14.dp, 14.dp, 14.dp, 4.dp)
+    Column(Modifier.fillMaxWidth(0.95f).clip(shape).background(c.sf).border(1.dp, c.bd, shape).padding(horizontal = 14.dp, vertical = 8.dp)) {
+        steps.forEach { st ->
+            Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(18.dp).clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(when (st.state) { 2 -> c.ok; 3 -> Color(0xFFE0564A); else -> Color.Transparent })
+                        .border(2.dp, when (st.state) { 2 -> c.ok; 3 -> Color(0xFFE0564A); 1 -> c.ac; else -> c.bd }, androidx.compose.foundation.shape.CircleShape),
+                    Alignment.Center,
+                ) {
+                    when (st.state) {
+                        2 -> Icon(Ic.Check, null, Modifier.size(11.dp), tint = Color.White)
+                        3 -> Icon(Ic.Close, null, Modifier.size(11.dp), tint = Color.White)
+                        1 -> CircularProgressIndicator(Modifier.size(11.dp), color = c.ac, strokeWidth = 1.5.dp)
+                        else -> {}
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(st.label, color = if (st.state == 0) c.mu else c.tx, fontSize = 13.sp, fontWeight = if (st.state == 1) FontWeight.SemiBold else FontWeight.Normal)
+            }
+        }
+    }
+}
+
+/** "FILE|created|path" notes show as a small card instead of code. */
+@Composable
+private fun FileCard(content: String) {
+    val c = VCT.c
+    val parts = content.split("|", limit = 3)
+    val status = parts.getOrElse(1) { "updated" }
+    val path = parts.getOrElse(2) { "" }
+    val shape = RoundedCornerShape(10.dp)
+    Row(
+        Modifier.fillMaxWidth(0.95f).clip(shape).background(c.sf).border(1.dp, c.bd, shape).padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Ic.File, null, Modifier.size(17.dp), tint = c.ac)
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(path.substringAfterLast('/'), color = c.tx, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text(path.substringBeforeLast('/', ""), color = c.mu, fontSize = 10.5.sp, maxLines = 1)
+        }
+        Chip(status, active = status == "created")
     }
 }

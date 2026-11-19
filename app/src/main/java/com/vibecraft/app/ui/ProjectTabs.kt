@@ -18,7 +18,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -28,7 +27,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.vibecraft.app.AppVm
-import com.vibecraft.app.data.CheckpointEntity
 import com.vibecraft.app.data.FileEntity
 import kotlinx.coroutines.flow.flowOf
 
@@ -47,6 +45,14 @@ private fun filesOf(vm: AppVm, id: String?): List<FileEntity> {
     return list
 }
 
+/** Adds a viewport and zero margins so full-height layouts from the AI fill the phone frame. */
+private fun prepared(html: String): String {
+    val head = "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>html,body{margin:0;min-height:100%}</style>"
+    val re = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
+    val match = re.find(html) ?: return head + html
+    return html.replaceRange(match.range, match.value + head)
+}
+
 @Composable
 fun PreviewTab(vm: AppVm, projectId: String?) {
     val html = filesOf(vm, projectId).firstOrNull { it.path == "preview.html" }?.content
@@ -63,6 +69,7 @@ fun PreviewTab(vm: AppVm, projectId: String?) {
                     factory = { ctx ->
                         WebView(ctx).apply {
                             settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
                             settings.blockNetworkLoads = true
                             settings.allowFileAccess = false
                             settings.allowContentAccess = false
@@ -72,10 +79,10 @@ fun PreviewTab(vm: AppVm, projectId: String?) {
                     update = {
                         if (it.tag != html.hashCode()) {
                             it.tag = html.hashCode()
-                            it.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+                            it.loadDataWithBaseURL(null, prepared(html), "text/html", "utf-8", null)
                         }
                     },
-                    modifier = Modifier.fillMaxSize().testTag("preview_webview"),
+                    modifier = Modifier.fillMaxSize(),
                 )
             }
             Note("Design preview only. The real app is built from the Kotlin files when you publish.")
@@ -89,10 +96,10 @@ fun CodeTab(vm: AppVm, projectId: String?) {
     var history by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<FileEntity?>(null) }
     val files = filesOf(vm, projectId)
-    val cps by remember(projectId) { if (projectId != null) vm.checkpoints(projectId) else flowOf(emptyList<CheckpointEntity>()) }
+    val cps by remember(projectId) { if (projectId != null) vm.checkpoints(projectId) else flowOf(emptyList<com.vibecraft.app.data.CheckpointEntity>()) }
         .collectAsState(initial = emptyList())
     TabPage {
-        SlidingTabs(listOf("Files", "History"), if (history) 1 else 0, { history = it == 1 }, Modifier.testTag("code_mode_tabs"))
+        SlidingTabs(listOf("Files", "History"), if (history) 1 else 0, { history = it == 1 })
         Spacer(Modifier.height(14.dp))
         if (!history) {
             if (files.isEmpty()) Empty("No files yet", "Files the AI writes appear here.")
@@ -148,7 +155,11 @@ fun CodeTab(vm: AppVm, projectId: String?) {
                     modifier = Modifier.padding(top = 10.dp).weight(1f, fill = false).clip(RoundedCornerShape(10.dp)).background(c.sf2)
                         .verticalScroll(rememberScrollState()).padding(12.dp),
                 )
-                VcButton("Close", { viewing = null }, Modifier.padding(top = 12.dp).fillMaxWidth().testTag("close_file_button"), secondary = true)
+                val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+                Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    VcButton("Copy", { clipboard.setText(androidx.compose.ui.text.AnnotatedString(f.content)) }, Modifier.weight(1f), secondary = true)
+                    VcButton("Close", { viewing = null }, Modifier.weight(1f))
+                }
             }
         }
     }
@@ -194,7 +205,7 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
             VcButton(
                 "Get token on GitHub",
                 { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/settings/tokens/new?scopes=repo,workflow&description=Vibecraft"))) },
-                Modifier.padding(top = 10.dp).fillMaxWidth().testTag("get_token_button"), secondary = true, icon = Ic.Up,
+                Modifier.padding(top = 10.dp).fillMaxWidth(), secondary = true, icon = Ic.Up,
             )
             Text(
                 "Prefer limited access? Create a fine-grained token (Contents and Workflows: read and write, Actions: read)",
@@ -205,7 +216,7 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
             )
             VcButton(
                 "Commit & push", { vm.publish(projectId, repo, branch, msg, token); token = "" },
-                Modifier.padding(top = 14.dp).fillMaxWidth().testTag("publish_button"), enabled = !running, loading = running, icon = Ic.Up,
+                Modifier.padding(top = 14.dp).fillMaxWidth(), enabled = !running, loading = running, icon = Ic.Up,
             )
         }
         Spacer(Modifier.height(14.dp))
@@ -221,7 +232,7 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                 )
                 VcButton(
                     "Open build on GitHub", { vm.runUrl?.let { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) } },
-                    Modifier.fillMaxWidth().testTag("open_build_button"), secondary = true, icon = Ic.Down,
+                    Modifier.fillMaxWidth(), secondary = true, icon = Ic.Down,
                 )
             }
             if (stage == 4) {
@@ -232,7 +243,7 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                         modifier = Modifier.padding(top = 8.dp).fillMaxWidth().heightIn(max = 220.dp).clip(RoundedCornerShape(10.dp))
                             .background(c.sf2).verticalScroll(rememberScrollState()).padding(10.dp),
                     )
-                    VcButton("Fix with AI", { vm.fixBuild(projectId); onFix() }, Modifier.padding(top = 12.dp).fillMaxWidth().testTag("fix_build_button"), icon = Ic.Check)
+                    VcButton("Fix with AI", { vm.fixBuild(projectId); onFix() }, Modifier.padding(top = 12.dp).fillMaxWidth(), icon = Ic.Check)
                 }
                 vm.runUrl?.let { url ->
                     Text(

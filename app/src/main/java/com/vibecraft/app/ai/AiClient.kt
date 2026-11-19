@@ -15,6 +15,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -28,19 +29,36 @@ class Fallback(message: String) : Exception(message)
 /** Anything else (bad key, bad request, no network): show it, do not switch. */
 class AiError(message: String) : Exception(message)
 
+/** text, plus cut = the provider stopped because of its length limit. */
+data class Reply(val text: String, val cut: Boolean = false)
+
 object AiClient {
-    /** Hidden project rules, sent with every request so every model follows the same ones. */
-    const val SYSTEM = "You are Vibecraft, an assistant that designs and writes Android apps with Kotlin and Jetpack Compose. " +
-        "Use Material 3 and a clean white and forest green look. Keep answers short and practical for beginners. " +
-        "When you create or change files, put each file in its own fenced code block whose FIRST line is a comment with the file path, " +
-        "for example // app/src/main/java/com/vibecraft/generated/HomeScreen.kt . Always send the complete file, never a fragment. " +
-        "Rules for the project: the code package is com.vibecraft.generated; the entry point is a composable function " +
-        "fun AppRoot() in app/src/main/java/com/vibecraft/generated/AppRoot.kt; only these libraries are available: " +
-        "Compose BOM with ui, foundation, material3, material-icons-core, activity-compose, lifecycle viewmodel and runtime compose, " +
-        "and kotlinx coroutines. Do not use other libraries and do not edit Gradle files. " +
-        "For every new app or screen change also send preview.html: one self-contained HTML file, with inline CSS and JS and no external " +
-        "resources, that shows the main screen like the app looks, using the same colors. Start it with <!-- preview.html -->. " +
-        "Never ask the user for passwords or API keys."
+    private const val RULES = "You are Vibecraft, an assistant that designs and writes Android apps with Kotlin and Jetpack Compose. " +
+        "Use Material 3 and a clean white and forest green look. Reply in the language the user writes. " +
+        "Project rules: the code package is com.vibecraft.generated; the entry point is a composable function fun AppRoot() in " +
+        "app/src/main/java/com/vibecraft/generated/AppRoot.kt; all Kotlin files live in app/src/main/java/com/vibecraft/generated/; " +
+        "only these libraries exist: Compose BOM with ui, foundation, material3, material-icons-core, activity-compose, " +
+        "lifecycle viewmodel and runtime compose, and kotlinx coroutines. Do not use other libraries and do not edit Gradle files. " +
+        "Never ask the user for passwords or API keys. "
+
+    /** Step 1: decide between a plain answer and a short plan of files. */
+    const val SYS_PLAN = RULES +
+        "Decide what the user wants. If they want an app built or changed, reply in EXACTLY this format and nothing else: " +
+        "a first line 'SUMMARY: ' with one or two friendly sentences for the user, then one line per file: " +
+        "'FILE: <path> | <what it does in under 12 words>'. List only files that must be created or changed, at most 8, " +
+        "each short (under 200 lines). Order them so files used by other files come first, then AppRoot.kt. " +
+        "Add preview.html last when the look of the app changes or the project has no preview. " +
+        "If the user only asks a question or chats, answer in a few sentences and write no FILE lines."
+
+    /** Step 2: one request per file. */
+    const val SYS_FILE = RULES +
+        "You write exactly one file now. Reply with ONLY one fenced code block and no other text. " +
+        "For a new file send the complete file. For an existing file you may instead send edit blocks inside the code block, " +
+        "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
+        "Send only the edits that are needed. preview.html must be one self-contained HTML file with inline CSS and JS and " +
+        "no external resources, made for a 260 by 500 pixel phone screen, using the same colors as the app."
+
+    const val SYSTEM = SYS_PLAN
 
     private val http by lazy {
         HttpClient(OkHttp) {
@@ -53,7 +71,10 @@ object AiClient {
     }
     private val json = Json { ignoreUnknownKeys = true }
 
-    suspend fun chat(p: Profile, key: String, history: List<Pair<String, String>>, system: String = SYSTEM): String {
+    suspend fun chat(p: Profile, key: String, history: List<Pair<String, String>>, system: String = SYSTEM): String =
+        chatFull(p, key, history, system).text
+
+    suspend fun chatFull(p: Profile, key: String, history: List<Pair<String, String>>, system: String = SYSTEM): Reply {
         if (p.baseUrl.isBlank()) throw AiError("The base URL is empty.")
         val base = p.baseUrl.trim().trimEnd('/')
         val h = merge(history)
@@ -67,7 +88,12 @@ object AiClient {
                     put("system", system)
                     putJsonArray("messages") { h.forEach { add(buildJsonObject { put("role", it.first); put("content", it.second) }) } }
                 },
-            ) { root -> root["content"]!!.jsonArray.joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.content ?: "" } }
+            ) { root ->
+                Reply(
+                    root["content"]!!.jsonArray.joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.content ?: "" },
+                    root["stop_reason"]?.jsonPrimitive?.contentOrNull == "max_tokens",
+                )
+            }
 
             "gemini" -> call(
                 "$base/models/${p.model}:generateContent",
@@ -84,8 +110,11 @@ object AiClient {
                     }
                 },
             ) { root ->
-                root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
-                    .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.content ?: "" }
+                val cand = root["candidates"]!!.jsonArray[0].jsonObject
+                Reply(
+                    cand["content"]!!.jsonObject["parts"]!!.jsonArray.joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.content ?: "" },
+                    cand["finishReason"]?.jsonPrimitive?.contentOrNull == "MAX_TOKENS",
+                )
             }
 
             else -> call(
@@ -98,7 +127,13 @@ object AiClient {
                         h.forEach { add(buildJsonObject { put("role", it.first); put("content", it.second) }) }
                     }
                 },
-            ) { root -> root["choices"]!!.jsonArray[0].jsonObject["message"]!!.jsonObject["content"]!!.jsonPrimitive.content }
+            ) { root ->
+                val ch = root["choices"]!!.jsonArray[0].jsonObject
+                Reply(
+                    ch["message"]!!.jsonObject["content"]!!.jsonPrimitive.content,
+                    ch["finish_reason"]?.jsonPrimitive?.contentOrNull == "length",
+                )
+            }
         }
     }
 
@@ -113,7 +148,7 @@ object AiClient {
         return out
     }
 
-    private suspend fun call(url: String, headers: Map<String, String>, body: JsonObject, parse: (JsonObject) -> String): String {
+    private suspend fun call(url: String, headers: Map<String, String>, body: JsonObject, parse: (JsonObject) -> Reply): Reply {
         val r = try {
             http.post(url) {
                 headers.forEach { (k, v) -> header(k, v) }
@@ -132,7 +167,7 @@ object AiClient {
             if (limited) throw Fallback(msg) else throw AiError(msg)
         }
         return try {
-            parse(json.parseToJsonElement(text).jsonObject).trim()
+            parse(json.parseToJsonElement(text).jsonObject).let { it.copy(text = it.text.trim()) }
         } catch (e: Exception) {
             throw AiError("Unexpected response from the provider.")
         }
