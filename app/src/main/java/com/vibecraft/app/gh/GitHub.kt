@@ -82,7 +82,8 @@ object GitHub {
         if (!Regex("^[\\w.-]+/[\\w.-]+$").matches(repo)) throw GhError("Enter the repository as owner/name.")
         var br = branch.ifBlank { "main" }
         var ref = call(HttpMethod.Get, token, "/repos/$repo/git/ref/heads/$br")
-        if (ref.code == 404) {
+        // A brand-new repository answers 409 "Git Repository is empty"; a missing branch answers 404.
+        if (ref.code == 404 || ref.code == 409) {
             val info = call(HttpMethod.Get, token, "/repos/$repo")
             if (info.code != 200) throw GhError(msg(info))
             val def = obj(info.body)?.get("default_branch")?.jsonPrimitive?.contentOrNull ?: "main"
