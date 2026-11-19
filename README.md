@@ -1,11 +1,17 @@
-<div align="center">
+# Vibecraft (stage 3)
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Stage 1: login, projects, chat on the phone, Supabase cloud backup.
+Stage 2: real AI replies with your own API keys and automatic fallback between profiles.
+Stage 3 (this build):
+- Code blocks the AI sends are saved as project files, every change becomes a version (Code tab, History, Restore).
+- Preview tab shows the design preview (preview.html) the AI adds.
+- Publish tab commits the project (plus Gradle and workflow files) to your GitHub repository,
+  watches the Actions build, and offers "Fix with AI" with the error lines if the build fails.
 
-  <h1>Built with AI Studio</h2>
+## Build this app's APK with GitHub Actions
+1. Upload everything in this folder to a GitHub repository (keep the `.github` folder).
+2. Actions tab > "Build APK" (also runs on every push to `main`).
+3. Download the `vibecraft-debug-apk` artifact and install `app-debug.apk`.
+4. If the build fails, download the `build-log` artifact and send it to Claude.
 
-  <p>The fastest path from prompt to production with Gemini.</p>
-
-  <a href="https://aistudio.google.com/apps">Start building</a>
-
-</div>
+For publishing from the app you need a GitHub token that can write code and workflows to the target repository.
