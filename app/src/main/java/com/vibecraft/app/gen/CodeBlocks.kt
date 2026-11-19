@@ -56,8 +56,14 @@ object CodeBlocks {
     fun normalize(path: String, content: String): Pair<String, String> {
         if (!path.endsWith(".kt")) return path to content
         val p = if (path.startsWith("$GEN/")) path else "$GEN/${path.substringAfterLast('/')}"
-        val c = content.replace(Regex("(?m)^package\\s+[\\w.]+")) { r ->
+        var c = content.replace(Regex("(?m)^package\\s+[\\w.]+")) { r ->
             if (r.value.contains("com.vibecraft.generated")) r.value else "package com.vibecraft.generated"
+        }
+        if (!Regex("(?m)^package\\s").containsMatchIn(c)) {
+            // No package line at all: add one (after any leading @file: annotations).
+            val lines = c.lines()
+            val k = lines.takeWhile { it.startsWith("@file:") || it.isBlank() }.size
+            c = (lines.take(k) + "package com.vibecraft.generated" + "" + lines.drop(k)).joinToString("\n")
         }
         return p to c
     }
