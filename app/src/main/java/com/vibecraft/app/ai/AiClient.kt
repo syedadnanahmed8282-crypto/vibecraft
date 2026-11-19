@@ -26,6 +26,9 @@ import kotlinx.serialization.json.putJsonObject
 /** The provider says "limit reached" or is overloaded: safe to try the next profile. */
 class Fallback(message: String) : Exception(message)
 
+/** The model did not answer in time (free models can be slow). Worth one retry, then the next profile. */
+class TimedOut(message: String) : Exception(message)
+
 /** Anything else (bad key, bad request, no network): show it, do not switch. */
 class AiError(message: String) : Exception(message)
 
@@ -44,7 +47,7 @@ object AiClient {
     /** Step 1: decide between a plain answer and a short plan of files. */
     const val SYS_PLAN = RULES +
         "Decide what the user wants. If they want an app built or changed, reply in EXACTLY this format and nothing else: " +
-        "a first line 'SUMMARY: ' with one or two friendly sentences for the user, then one line per file: " +
+        "a first line 'SUMMARY: ' with one or two friendly sentences saying what you are about to do (future tense, for example 'I will add...'), then one line per file: " +
         "'FILE: <path> | <what it does in under 12 words>'. List only files that must be created or changed, at most 8, " +
         "each short (under 200 lines). Order them so files used by other files come first, then AppRoot.kt. " +
         "Add preview.html last when the look of the app changes or the project has no preview. " +
@@ -63,9 +66,9 @@ object AiClient {
     private val http by lazy {
         HttpClient(OkHttp) {
             install(HttpTimeout) {
-                requestTimeoutMillis = 120_000
-                connectTimeoutMillis = 20_000
-                socketTimeoutMillis = 120_000
+                requestTimeoutMillis = 240_000
+                connectTimeoutMillis = 30_000
+                socketTimeoutMillis = 240_000
             }
         }
     }
@@ -149,16 +152,20 @@ object AiClient {
     }
 
     private suspend fun call(url: String, headers: Map<String, String>, body: JsonObject, parse: (JsonObject) -> Reply): Reply {
-        val r = try {
-            http.post(url) {
+        val (r, text) = try {
+            val res = http.post(url) {
                 headers.forEach { (k, v) -> header(k, v) }
                 contentType(ContentType.Application.Json)
                 setBody(body.toString())
             }
+            res to res.bodyAsText()
         } catch (e: Exception) {
+            val slow = e::class.simpleName?.contains("Timeout", true) == true ||
+                e.message?.contains("timeout", true) == true || e.message?.contains("timed out", true) == true
+            if (slow) throw TimedOut("The model took too long to answer.")
+            if (e is kotlinx.coroutines.CancellationException) throw e
             throw AiError("Network problem: ${e.message ?: "could not reach the provider"}")
         }
-        val text = r.bodyAsText()
         if (!r.status.isSuccess()) {
             val msg = (errorMessage(text) ?: r.status.description).take(160)
             val low = (msg + text.take(400)).lowercase()

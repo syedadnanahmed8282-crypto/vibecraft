@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.vibecraft.app.ai.AiClient
 import com.vibecraft.app.ai.Fallback
 import com.vibecraft.app.ai.Reply
+import com.vibecraft.app.ai.TimedOut
 import com.vibecraft.app.ai.Profile
 import com.vibecraft.app.ai.ProfileStore
 import com.vibecraft.app.data.CheckpointEntity
@@ -253,6 +254,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             return null
         }
         var i = 0
+        var retried = false
         while (i < order.size) {
             val p = order[i]
             try {
@@ -262,9 +264,23 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 return r
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: TimedOut) {
+                val next = order.getOrNull(i + 1)
+                if (!retried) {
+                    retried = true
+                    addMsg(projectId, "note", "${p.name} is slow. Trying once more…")
+                } else if (autoSwitch && next != null) {
+                    retried = false
+                    addMsg(projectId, "note", "${p.name} took too long. Switched to ${next.name} automatically.")
+                    i++
+                } else {
+                    addMsg(projectId, "note", "${p.name} did not answer in time. Try again, or pick a faster model.")
+                    return null
+                }
             } catch (e: Fallback) {
                 val next = order.getOrNull(i + 1)
                 if (autoSwitch && next != null) {
+                    retried = false
                     addMsg(projectId, "note", "${p.name} limit reached. Switched to ${next.name} automatically.")
                     i++
                 } else {
