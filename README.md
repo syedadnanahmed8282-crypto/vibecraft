@@ -9,9 +9,10 @@ Stage 3 (this build):
   watches the Actions build, and offers "Fix with AI" with the error lines if the build fails.
 
 ## Build this app's APK with GitHub Actions
-1. Upload everything in this folder to a GitHub repository (keep the `.github` folder).
-2. Actions tab > "Build APK" (also runs on every push to `main`).
+1. Commit and push this repository to GitHub (keep the `.github` folder).
+2. As soon as you push, GitHub Actions > "Build APK" starts automatically (you can also trigger it manually from the Actions tab).
 3. Download the `vibecraft-debug-apk` artifact and install `app-debug.apk`.
-4. If the build fails, download the `build-log` artifact and send it to Claude.
+4. If the build fails, download the `build-log` artifact to inspect the error.
 
-For publishing from the app you need a GitHub token that can write code and workflows to the target repository.
+No Gradle wrapper is included; the workflow installs Gradle 9.3.1 automatically.
+For publishing generated apps from inside Vibecraft, you need a GitHub token with code and workflow write access to the target repository.
