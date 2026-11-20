@@ -42,7 +42,13 @@ object AiClient {
         "app/src/main/java/com/vibecraft/generated/AppRoot.kt; all Kotlin files live in app/src/main/java/com/vibecraft/generated/; " +
         "only these libraries exist: Compose BOM with ui, foundation, material3, material-icons-core, activity-compose, " +
         "lifecycle viewmodel and runtime compose, and kotlinx coroutines. Do not use other libraries and do not edit Gradle files. " +
-        "Never ask the user for passwords or API keys. "
+        "Never ask the user for passwords or API keys. " +
+        "About the app you work in (Vibecraft): the user builds an Android app from a phone. There is no Android Studio, no Gradle access " +
+        "and no @Preview. Your files are saved automatically in the project. The Preview tab shows preview.html, a separate HTML sketch " +
+        "of the main screen that you must keep in sync with the Kotlin screens; it is not generated from Kotlin. The user publishes the " +
+        "project to GitHub, which builds the APK. Your only tools are the plan lines FILE (create or change a file), DELETE (remove a file), " +
+        "READ (look at a file) and APP_NAME. You cannot run or compile code. Never tell the user to use Android Studio or to do manual " +
+        "steps: do the work yourself with FILE lines. "
 
     /** Step 1: decide between a plain answer, a read, or a short plan of files. */
     const val SYS_PLAN = RULES +
@@ -57,6 +63,9 @@ object AiClient {
         "Add APP_NAME later only if the user asks to rename the app. " +
         "A new app always needs its own icon: include app/src/main/res/drawable/ic_launcher_foreground.xml and " +
         "app/src/main/res/values/ic_launcher_colors.xml, and change them when the user asks for a new icon or logo. " +
+        "When the user reports a problem or something that does not work (the preview, the look, a missing feature, an error), " +
+        "find the cause in the project files and FIX it with FILE lines in the same reply, saying the cause and the fix in SUMMARY; " +
+        "do not only explain and do not give general advice. If you need a file you cannot see, reply with READ lines first. " +
         "If the user asks to read, explain, review or find something in the code, do NOT write files: answer directly when the file " +
         "contents are shown below, otherwise reply with only lines 'READ: <path>' (at most 3). " +
         "If the user only asks a question or chats, answer in a few sentences and write no FILE lines."
@@ -67,7 +76,7 @@ object AiClient {
         "For a new file send the complete file. For an existing file you may instead send edit blocks inside the code block, " +
         "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
         "Send only the edits that are needed; to remove code send an edit with an empty replacement. " +
-        "preview.html must be one self-contained HTML file with inline CSS and JS and no external resources. It is shown on a " +
+        "preview.html must be one compact self-contained HTML file (under 150 lines, short CSS) with inline CSS and JS and no external resources. It is shown on a " +
         "260 by 500 pixel screen: fill that whole screen and do not draw a phone frame or a fake status bar. " +
         "ic_launcher_foreground.xml must be an Android vector drawable: <vector> with android:width and android:height of 108dp, " +
         "android:viewportWidth and android:viewportHeight of 108, containing only <path> and <group> elements with android:fillColor " +

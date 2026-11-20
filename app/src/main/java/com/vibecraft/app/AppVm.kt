@@ -237,12 +237,16 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         steps = steps.mapIndexed { j, st -> if (j == i) Step(st.label, state) else st }
     }
 
-    /** What the AI is told about the project: all files when small, otherwise just the list. */
+    /** What the AI is told about the project: the code files when they fit, otherwise just the list. */
     private suspend fun snapshotOf(projectId: String): String {
         val fs = dao.filesOnce(projectId).filter { it.deletedAt == null }
         if (fs.isEmpty()) return "The project has no files yet."
-        return if (fs.sumOf { it.content.length } <= 12_000) fs.joinToString("\n\n") { "--- ${it.path}\n${it.content}" }
-        else fs.joinToString("\n") { "${it.path} (${it.content.length} characters)" }
+        val sketch = fs.firstOrNull { it.path == "preview.html" }
+        val code = fs.filter { it.path != "preview.html" }
+        val body = if (code.sumOf { it.content.length } <= 16_000) code.joinToString("\n\n") { "--- ${it.path}\n${it.content}" }
+        else code.joinToString("\n") { "${it.path} (${it.content.length} characters)" } + "\n(contents not shown: use READ lines for the files you need)"
+        val tail = if (sketch != null) "\n\npreview.html: the design sketch, ${sketch.content.length} characters, not shown (use READ if you need it)" else ""
+        return body + tail
     }
 
     /** Asks the active model and moves to the next profile when one is out of quota. Null means it could not answer. */
@@ -330,7 +334,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         projectId: String, pf: PlanFile, plan: Plan, request: String,
         existing: Map<String, String>, written: Map<String, String>,
     ): String? {
-        val cur = written[pf.path] ?: existing[pf.path]
+        val isPreview = pf.path == "preview.html"
+        val cur = if (isPreview) null else (written[pf.path] ?: existing[pf.path])
         val others = (existing.keys + written.keys).filter { it != pf.path }
         val ctx = buildString {
             append("What the user asked:\n").append(request).append("\n\nPlan: ").append(plan.summary).append("\nFiles in this change:\n")
@@ -340,7 +345,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             }
             if (others.isNotEmpty()) append("\nOther files in the project: ").append(others.joinToString(", ")).append('\n')
             append("\nWrite this file now: ").append(pf.path).append(" (").append(pf.desc).append(").")
-            if (cur != null) append("\n\nIts current content:\n```\n").append(cur).append("\n```") else append("\n\nIt is a new file.")
+            if (isPreview) {
+                val ui = existing.filter { (p, c) -> p.endsWith(".kt") && p !in written && c.contains("@Composable") }.entries.take(3)
+                ui.forEach { (p, c) -> append("\nExisting screen ").append(p).append(":\n```\n").append(c.take(3000)).append("\n```\n") }
+                append("\nWrite a fresh, compact preview (under 150 lines) of the app's main screen as it looks after this change, ")
+                append("with its features visible. It replaces the old preview.")
+            } else if (cur != null) append("\n\nIts current content:\n```\n").append(cur).append("\n```") else append("\n\nIt is a new file.")
         }
         return produce(projectId, pf.path, cur, ctx)
     }
@@ -368,15 +378,6 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return saved.second
     }
 
-    /** A reading question: answer from the real file contents and never rewrite anything. */
-    private suspend fun answerFromFiles(projectId: String, request: String, paths: List<String>) {
-        steps = listOf(Step("Reading ${paths.size} file${if (paths.size == 1) "" else "s"}", 1))
-        val have = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
-        val ctx = paths.mapNotNull { p -> have[p]?.let { "--- $p\n${it.take(14_000)}" } }.joinToString("\n\n")
-        val r = askModel(projectId, AiClient.SYS_ANSWER, listOf("user" to "$request\n\nProject files:\n$ctx")) ?: return
-        addMsg(projectId, "assistant", r.text.ifBlank { "(empty reply)" })
-    }
-
     /** Closing note: what was done, which problem there was, and a commit message for GitHub. */
     private suspend fun summarize(
         projectId: String, request: String, plan: Plan, changed: List<String>, deleted: List<String>,
@@ -399,6 +400,15 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Words that suggest the user is reporting something broken rather than asking a question. */
+    private fun looksLikeProblem(t: String): Boolean {
+        val l = t.lowercase()
+        return listOf(
+            "সমস্যা", "দেখা যায় না", "দেখায় না", "দেখাচ্ছে না", "হচ্ছে না", "কাজ করছে না", "কাজ করে না", "ভুল", "ঠিক করো", "ঠিক কর",
+            "not working", "doesn't", "does not", "isn't", "problem", "issue", "bug", "error", "broken", "fix",
+        ).any { it in l }
+    }
+
     private suspend fun reply(projectId: String) {
         thinkingId = projectId
         steps = listOf(Step("Reading your request", 1))
@@ -408,11 +418,31 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(12).map { it.role to it.content }
             val sys = AiClient.SYS_PLAN + "\n\nCurrent project files:\n" + snapshotOf(projectId)
             val planReply = askModel(projectId, sys, history) ?: return
-            val text = planReply.text
+            var text = planReply.text
             var plan = PlanParser.parse(text)
 
+            // The AI asked to look at files first: give it their contents and let it plan again.
+            if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isNotEmpty()) {
+                steps = listOf(Step("Reading ${plan.reads.size} file${if (plan.reads.size == 1) "" else "s"}", 1))
+                val have = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+                val ctxFiles = plan.reads.mapNotNull { p -> have[p]?.let { "--- $p\n${it.take(14_000)}" } }.joinToString("\n\n")
+                val second = askModel(projectId, sys + "\n\nFiles you asked to read:\n" + ctxFiles, history) ?: return
+                text = second.text
+                plan = PlanParser.parse(text)
+            }
+            // A problem report answered with advice only: ask once more for the fix itself.
+            if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isEmpty() &&
+                CodeBlocks.files(text).isEmpty() && looksLikeProblem(request)
+            ) {
+                val again = askModel(
+                    projectId, sys,
+                    history + ("assistant" to text) +
+                        ("user" to "This is a problem report. Find the cause in the project files and fix it now: reply in the FILE format, or with READ lines if you need a file."),
+                )
+                if (again != null) { text = again.text; plan = PlanParser.parse(text) }
+            }
+
             if (plan.files.isEmpty() && plan.deletes.isEmpty()) {
-                if (plan.reads.isNotEmpty()) { answerFromFiles(projectId, request, plan.reads); return }
                 // A plain answer, or a model that ignored the format and sent code blocks anyway.
                 val found = CodeBlocks.files(text)
                 val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else text.ifBlank { "(empty reply)" }
@@ -455,7 +485,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             for ((i, pf) in files.withIndex()) {
                 setStep(i + 1, 1)
                 val out = writeFile(projectId, pf, plan, request, current, written)
-                if (out == null) { setStep(i + 1, 3); failedAt = pf.path.substringAfterLast('/'); break }
+                if (out == null) {
+                    setStep(i + 1, 3)
+                    if (pf.path == "preview.html") continue   // only the sketch failed; the app files are still saved
+                    failedAt = pf.path.substringAfterLast('/')
+                    break
+                }
                 written[pf.path] = out
                 setStep(i + 1, 2)
             }
