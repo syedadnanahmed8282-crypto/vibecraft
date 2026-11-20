@@ -2,6 +2,13 @@ package com.vibecraft.app.gen
 
 /** Build files added around the AI's code so the repository builds an APK on GitHub Actions. */
 object Template {
+    const val ICON_FG = "app/src/main/res/drawable/ic_launcher_foreground.xml"
+    const val ICON_COLORS = "app/src/main/res/values/ic_launcher_colors.xml"
+
+    /** File-name friendly version of the app name, used for the APK and the artifact. */
+    fun slug(appName: String): String =
+        appName.trim().replace(Regex("[^A-Za-z0-9]+"), "-").trim('-').ifBlank { "app" }.take(30)
+
     fun files(appName: String, projectId: String): Map<String, String> {
         val label = appName.replace("&", "&amp;").replace("<", "&lt;").replace("'", "\\'").replace("\"", "\\\"")
         val appId = "com.vibecraft.p" + projectId.filter { it.isLetterOrDigit() }.take(8).lowercase()
@@ -16,7 +23,10 @@ object Template {
             "app/src/main/res/values/themes.xml" to THEMES,
             "app/src/main/java/com/vibecraft/generated/MainActivity.kt" to MAIN,
             "app/src/main/java/com/vibecraft/generated/AppRoot.kt" to APPROOT,
-            ".github/workflows/build.yml" to WORKFLOW,
+            "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" to ICON_XML,
+            ICON_FG to ICON_FOREGROUND,
+            ICON_COLORS to ICON_COLOR_FILE,
+            ".github/workflows/build.yml" to workflow(slug(appName)),
         )
     }
 
@@ -98,6 +108,8 @@ dependencies {
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.Generated">
@@ -153,7 +165,32 @@ fun AppRoot() {
 }
 """.trimStart()
 
-    private val WORKFLOW = """
+    private const val ICON_XML = """<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+"""
+
+    private const val ICON_COLOR_FILE = """<resources>
+    <color name="ic_launcher_background">#1F6B43</color>
+</resources>
+"""
+
+    /** Neutral default icon (two leaves and a spark); the AI replaces it with an icon made for the app. */
+    private const val ICON_FOREGROUND = """<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group android:scaleX="0.55" android:scaleY="0.55" android:translateX="21" android:translateY="25">
+        <path android:fillColor="#FFFFFF" android:pathData="M60,92C34,82 22,56 26,28C52,34 66,60 60,92Z" />
+        <path android:fillColor="#B7E4C7" android:pathData="M60,92C86,82 98,56 94,28C68,34 54,60 60,92Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M60,12L63.5,22.5L74,26L63.5,29.5L60,40L56.5,29.5L46,26L56.5,22.5Z" />
+    </group>
+</vector>
+"""
+
+    private fun workflow(slug: String) = """
 name: Build APK
 on:
   push:
@@ -173,10 +210,12 @@ jobs:
           gradle-version: 8.10.2
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Name the APK
+        run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/$slug.apk
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: vibecraft-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: $slug-apk
+          path: app/build/outputs/apk/debug/$slug.apk
 """.trimStart()
 }

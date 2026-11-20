@@ -44,13 +44,21 @@ object AiClient {
         "lifecycle viewmodel and runtime compose, and kotlinx coroutines. Do not use other libraries and do not edit Gradle files. " +
         "Never ask the user for passwords or API keys. "
 
-    /** Step 1: decide between a plain answer and a short plan of files. */
+    /** Step 1: decide between a plain answer, a read, or a short plan of files. */
     const val SYS_PLAN = RULES +
         "Decide what the user wants. If they want an app built or changed, reply in EXACTLY this format and nothing else: " +
-        "a first line 'SUMMARY: ' with one or two friendly sentences saying what you are about to do (future tense, for example 'I will add...'), then one line per file: " +
-        "'FILE: <path> | <what it does in under 12 words>'. List only files that must be created or changed, at most 8, " +
-        "each short (under 200 lines). Order them so files used by other files come first, then AppRoot.kt. " +
+        "a first line 'SUMMARY: ' with one or two friendly sentences saying what you are about to do (future tense, for example 'I will add...'); " +
+        "for a new app a line 'APP_NAME: ' with a short, catchy, original name of one or two words (use the user's own name if they gave one); " +
+        "then one line per file: 'FILE: <path> | <what it does in under 12 words>'; " +
+        "and one line 'DELETE: <path>' for every file that is no longer needed. " +
+        "List only files that must be created or changed, at most 8, each short (under 200 lines). " +
+        "Order them so files used by other files come first, then AppRoot.kt. " +
         "Add preview.html last when the look of the app changes or the project has no preview. " +
+        "Add APP_NAME later only if the user asks to rename the app. " +
+        "A new app always needs its own icon: include app/src/main/res/drawable/ic_launcher_foreground.xml and " +
+        "app/src/main/res/values/ic_launcher_colors.xml, and change them when the user asks for a new icon or logo. " +
+        "If the user asks to read, explain, review or find something in the code, do NOT write files: answer directly when the file " +
+        "contents are shown below, otherwise reply with only lines 'READ: <path>' (at most 3). " +
         "If the user only asks a question or chats, answer in a few sentences and write no FILE lines."
 
     /** Step 2: one request per file. */
@@ -58,8 +66,25 @@ object AiClient {
         "You write exactly one file now. Reply with ONLY one fenced code block and no other text. " +
         "For a new file send the complete file. For an existing file you may instead send edit blocks inside the code block, " +
         "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
-        "Send only the edits that are needed. preview.html must be one self-contained HTML file with inline CSS and JS and " +
-        "no external resources, made for a 260 by 500 pixel phone screen, using the same colors as the app."
+        "Send only the edits that are needed; to remove code send an edit with an empty replacement. " +
+        "preview.html must be one self-contained HTML file with inline CSS and JS and no external resources. It is shown on a " +
+        "260 by 500 pixel screen: fill that whole screen and do not draw a phone frame or a fake status bar. " +
+        "ic_launcher_foreground.xml must be an Android vector drawable: <vector> with android:width and android:height of 108dp, " +
+        "android:viewportWidth and android:viewportHeight of 108, containing only <path> and <group> elements with android:fillColor " +
+        "as a hex color and android:pathData; keep all artwork inside the central square from 21 to 87; use simple bold shapes that " +
+        "suit the app, at most three colors, no gradients and no text. ic_launcher_colors.xml must be exactly: " +
+        "<resources><color name=\"ic_launcher_background\">#RRGGBB</color></resources> with a color that suits the icon."
+
+    /** Reading questions: answer from the files, never rewrite them. */
+    const val SYS_ANSWER = RULES +
+        "Answer the user's question about the project code below in a few short sentences, in the user's language. " +
+        "Do not write or rewrite files and do not paste long code; quote only the few lines that matter."
+
+    /** Closing note after a change. */
+    const val SYS_SUMMARY = "You write the closing note of a coding task. Reply in exactly two lines. " +
+        "First line: 'COMMIT: ' then a git commit message in English, imperative mood, under 60 characters. " +
+        "Second line: 'SUMMARY: ' then two or three short friendly sentences in the language the user wrote, saying what you did, " +
+        "which problem there was (if any) and that it was fixed. No code and no markdown."
 
     const val SYSTEM = SYS_PLAN
 

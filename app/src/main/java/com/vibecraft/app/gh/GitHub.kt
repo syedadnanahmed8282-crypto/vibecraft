@@ -14,6 +14,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
@@ -78,7 +79,7 @@ object GitHub {
         obj(r.body)!!["object"]!!.jsonObject["sha"]!!.jsonPrimitive.content
 
     /** Creates one commit holding all files on top of the branch. Returns the new commit sha. */
-    suspend fun push(token: String, repo: String, branch: String, message: String, files: Map<String, String>): String {
+    suspend fun push(token: String, repo: String, branch: String, message: String, files: Map<String, String>, deletes: Set<String> = emptySet()): String {
         if (!Regex("^[\\w.-]+/[\\w.-]+$").matches(repo)) throw GhError("Enter the repository as owner/name.")
         var br = branch.ifBlank { "main" }
         var ref = call(HttpMethod.Get, token, "/repos/$repo/git/ref/heads/$br")
@@ -109,11 +110,31 @@ object GitHub {
         val commit = call(HttpMethod.Get, token, "/repos/$repo/git/commits/$parent")
         if (commit.code != 200) throw GhError(msg(commit))
         val baseTree = obj(commit.body)!!["tree"]!!.jsonObject["sha"]!!.jsonPrimitive.content
+        // Compare with what the repository already holds, so only real changes are sent and nothing empty is committed.
+        val remote = HashMap<String, String>()
+        var complete = false
+        val listing = call(HttpMethod.Get, token, "/repos/$repo/git/trees/$baseTree?recursive=1")
+        if (listing.code == 200) {
+            val o = obj(listing.body)
+            complete = o?.get("truncated")?.jsonPrimitive?.contentOrNull != "true"
+            o?.get("tree")?.jsonArray?.forEach { e ->
+                val eo = e.jsonObject
+                if (eo["type"]?.jsonPrimitive?.contentOrNull == "blob") {
+                    remote[eo["path"]!!.jsonPrimitive.content] = eo["sha"]!!.jsonPrimitive.content
+                }
+            }
+        }
+        val send = if (complete) files.filter { (p, c) -> remote[p] != blobSha(c) } else files
+        val remove = if (complete) deletes.filter { it in remote } else emptyList()
+        if (send.isEmpty() && remove.isEmpty()) throw GhError("Nothing new to publish. Your repository already has these files.")
         val tree = call(HttpMethod.Post, token, "/repos/$repo/git/trees", buildJsonObject {
             put("base_tree", baseTree)
             putJsonArray("tree") {
-                files.forEach { (p, c) ->
+                send.forEach { (p, c) ->
                     add(buildJsonObject { put("path", p); put("mode", "100644"); put("type", "blob"); put("content", c) })
+                }
+                remove.forEach { p ->
+                    add(buildJsonObject { put("path", p); put("mode", "100644"); put("type", "blob"); put("sha", JsonNull) })
                 }
             }
         })
@@ -128,6 +149,15 @@ object GitHub {
         val up = call(HttpMethod.Patch, token, "/repos/$repo/git/refs/heads/$br", buildJsonObject { put("sha", newSha) })
         if (up.code != 200) throw GhError(msg(up))
         return newSha
+    }
+
+    /** The id GitHub gives a file with this content, so unchanged files can be skipped. */
+    private fun blobSha(text: String): String {
+        val b = text.toByteArray(Charsets.UTF_8)
+        val md = java.security.MessageDigest.getInstance("SHA-1")
+        md.update("blob ${b.size}\u0000".toByteArray())
+        md.update(b)
+        return md.digest().joinToString("") { "%02x".format(it) }
     }
 
     /** Waits for the Actions run of this commit to appear and finish. */

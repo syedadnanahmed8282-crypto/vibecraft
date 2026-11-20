@@ -21,6 +21,7 @@ import com.vibecraft.app.data.SyncRepo
 import com.vibecraft.app.ui.ThemeMode
 import com.vibecraft.app.gen.CodeBlocks
 import com.vibecraft.app.gen.Edits
+import com.vibecraft.app.gen.Lint
 import com.vibecraft.app.gen.Plan
 import com.vibecraft.app.gen.PlanFile
 import com.vibecraft.app.gen.PlanParser
@@ -229,7 +230,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         backgroundSync()
     }
 
-    // ---- AI work: a short plan first, then one request per file ----
+    // ---- AI work: plan, read, write one file at a time, check, save, summarize ----
     var steps by mutableStateOf<List<Step>>(emptyList()); private set
 
     private fun setStep(i: Int, state: Int) {
@@ -244,13 +245,14 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         else fs.joinToString("\n") { "${it.path} (${it.content.length} characters)" }
     }
 
-    /** Asks the active model and moves to the next profile when one is out of quota. Null means a note was added to the chat. */
-    private suspend fun askModel(projectId: String, system: String, msgs: List<Pair<String, String>>): Reply? {
+    /** Asks the active model and moves to the next profile when one is out of quota. Null means it could not answer. */
+    private suspend fun askModel(projectId: String, system: String, msgs: List<Pair<String, String>>, quiet: Boolean = false): Reply? {
+        suspend fun say(t: String) { if (!quiet) addMsg(projectId, "note", t) }
         val usable = profiles.filter { store.key(it.id) != null }
         val first = usable.firstOrNull { it.id == activeId }
         val order = listOfNotNull(first) + usable.filter { it !== first }
         if (order.isEmpty()) {
-            addMsg(projectId, "note", "Add an AI profile with an API key in Settings to get replies.")
+            say("Add an AI profile with an API key in Settings to get replies.")
             return null
         }
         var i = 0
@@ -268,27 +270,27 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 val next = order.getOrNull(i + 1)
                 if (!retried) {
                     retried = true
-                    addMsg(projectId, "note", "${p.name} is slow. Trying once more…")
+                    say("${p.name} is slow. Trying once more…")
                 } else if (autoSwitch && next != null) {
                     retried = false
-                    addMsg(projectId, "note", "${p.name} took too long. Switched to ${next.name} automatically.")
+                    say("${p.name} took too long. Switched to ${next.name} automatically.")
                     i++
                 } else {
-                    addMsg(projectId, "note", "${p.name} did not answer in time. Try again, or pick a faster model.")
+                    say("${p.name} did not answer in time. Try again, or pick a faster model.")
                     return null
                 }
             } catch (e: Fallback) {
                 val next = order.getOrNull(i + 1)
                 if (autoSwitch && next != null) {
                     retried = false
-                    addMsg(projectId, "note", "${p.name} limit reached. Switched to ${next.name} automatically.")
+                    say("${p.name} limit reached. Switched to ${next.name} automatically.")
                     i++
                 } else {
-                    addMsg(projectId, "note", "${p.name} limit reached." + if (!autoSwitch) " Auto-switch is off." else "")
+                    say("${p.name} limit reached." + if (!autoSwitch) " Auto-switch is off." else "")
                     return null
                 }
             } catch (e: Exception) {
-                addMsg(projectId, "note", "${p.name}: ${e.message ?: "request failed"}")
+                say("${p.name}: ${e.message ?: "request failed"}")
                 return null
             }
         }
@@ -302,7 +304,28 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return body?.let { CodeBlocks.dropPathLine(it).trimEnd('\n') + "\n" }
     }
 
-    /** Writes one file. For existing files the AI may send only the changed parts. Null means it could not. */
+    /** Asks for one file (new, or changed parts only) and returns its final text. Null means it could not. */
+    private suspend fun produce(projectId: String, path: String, cur: String?, ctx: String): String? {
+        val name = path.substringAfterLast('/')
+        val r = askModel(projectId, AiClient.SYS_FILE, listOf("user" to ctx)) ?: return null
+        var body = codeOf(r)
+        if (body == null) {
+            addMsg(projectId, "note", "The reply for $name was cut off or had no code. Try again, or use a model with a longer limit.")
+            return null
+        }
+        if (Edits.isEdit(body)) {
+            val applied = if (cur != null) Edits.apply(cur, body) else null
+            if (applied != null) return CodeBlocks.normalize(path, applied).second
+            val r2 = askModel(projectId, AiClient.SYS_FILE, listOf("user" to (ctx + "\n\nYour edit did not match the file. Send the complete new file in one code block instead."))) ?: return null
+            body = codeOf(r2)
+            if (body == null || Edits.isEdit(body)) {
+                addMsg(projectId, "note", "Could not apply the change to $name.")
+                return null
+            }
+        }
+        return CodeBlocks.normalize(path, body).second
+    }
+
     private suspend fun writeFile(
         projectId: String, pf: PlanFile, plan: Plan, request: String,
         existing: Map<String, String>, written: Map<String, String>,
@@ -319,38 +342,61 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             append("\nWrite this file now: ").append(pf.path).append(" (").append(pf.desc).append(").")
             if (cur != null) append("\n\nIts current content:\n```\n").append(cur).append("\n```") else append("\n\nIt is a new file.")
         }
-        val name = pf.path.substringAfterLast('/')
-        val r = askModel(projectId, AiClient.SYS_FILE, listOf("user" to ctx)) ?: return null
-        var body = codeOf(r)
-        if (body == null) {
-            addMsg(projectId, "note", "The reply for $name was cut off or had no code. Try again, or use a model with a longer limit.")
-            return null
-        }
-        if (Edits.isEdit(body)) {
-            val applied = if (cur != null) Edits.apply(cur, body) else null
-            if (applied != null) return CodeBlocks.normalize(pf.path, applied).second
-            val r2 = askModel(projectId, AiClient.SYS_FILE, listOf("user" to (ctx + "\n\nYour edit did not match the file. Send the complete new file in one code block instead."))) ?: return null
-            body = codeOf(r2)
-            if (body == null || Edits.isEdit(body)) {
-                addMsg(projectId, "note", "Could not apply the change to $name.")
-                return null
-            }
-        }
-        return CodeBlocks.normalize(pf.path, body).second
+        return produce(projectId, pf.path, cur, ctx)
     }
 
-    /** Saves the files as one version and adds a card per changed file to the chat. */
-    private suspend fun commit(projectId: String, files: List<Pair<String, String>>, request: String): Boolean {
+    /** Repairs a file the checker found problems in, changing only what is needed. */
+    private suspend fun fixFile(projectId: String, path: String, content: String, problems: List<String>, request: String): String? {
+        val ctx = "What the user asked:\n$request\n\nThis file has problems that would break the build:\n" +
+            problems.joinToString("\n") { "- $it" } +
+            "\n\nFix only these problems. Current content of $path:\n```\n$content\n```\nSend edit blocks (preferred) or the complete file."
+        return produce(projectId, path, content, ctx)
+    }
+
+    /** Saves the files as one version, adds a card per changed file to the chat, and returns the version. */
+    private suspend fun commit(projectId: String, files: List<Pair<String, String>>, deletes: List<String>, request: String): Int? {
         val old = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
         val changed = files.filter { old[it.first] != it.second }
-        val saved = saveFiles(projectId, files, request, activeName)
+        val saved = saveFiles(projectId, files, request, activeName, deletes)
         if (saved == null) {
             addMsg(projectId, "note", "Nothing changed: the files are already up to date.")
-            return false
+            return null
         }
         changed.forEach { (path, _) -> addMsg(projectId, "note", "FILE|${if (path in old) "updated" else "created"}|$path") }
+        deletes.forEach { addMsg(projectId, "note", "FILE|deleted|$it") }
         addMsg(projectId, "note", "Saved ${saved.first} file${if (saved.first == 1) "" else "s"} · v${saved.second}")
-        return true
+        return saved.second
+    }
+
+    /** A reading question: answer from the real file contents and never rewrite anything. */
+    private suspend fun answerFromFiles(projectId: String, request: String, paths: List<String>) {
+        steps = listOf(Step("Reading ${paths.size} file${if (paths.size == 1) "" else "s"}", 1))
+        val have = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+        val ctx = paths.mapNotNull { p -> have[p]?.let { "--- $p\n${it.take(14_000)}" } }.joinToString("\n\n")
+        val r = askModel(projectId, AiClient.SYS_ANSWER, listOf("user" to "$request\n\nProject files:\n$ctx")) ?: return
+        addMsg(projectId, "assistant", r.text.ifBlank { "(empty reply)" })
+    }
+
+    /** Closing note: what was done, which problem there was, and a commit message for GitHub. */
+    private suspend fun summarize(
+        projectId: String, request: String, plan: Plan, changed: List<String>, deleted: List<String>,
+        fixRounds: Int, warnings: List<String>, version: Int,
+    ) {
+        val prompt = buildString {
+            append("User request:\n").append(request).append("\n\nPlan: ").append(plan.summary)
+            append("\nFiles changed: ").append(changed.joinToString(", ").ifBlank { "none" })
+            append("\nFiles deleted: ").append(deleted.joinToString(", ").ifBlank { "none" })
+            append("\nCode problems found and fixed automatically before saving: ")
+            append(if (fixRounds > 0) "yes, in $fixRounds round(s)" else "none")
+            append("\nRemaining warnings: ").append(if (warnings.isEmpty()) "none" else warnings.take(3).joinToString("; "))
+        }
+        val r = askModel(projectId, AiClient.SYS_SUMMARY, listOf("user" to prompt), quiet = true) ?: return
+        val commitLine = Regex("(?im)^\\s*COMMIT:\\s*(.+)$").find(r.text)?.groupValues?.get(1)?.trim()?.trim('"', '`')?.take(72)
+        val summary = Regex("(?is)SUMMARY:\\s*(.+)$").find(r.text)?.groupValues?.get(1)?.trim()
+        if (!summary.isNullOrBlank()) addMsg(projectId, "assistant", summary)
+        if (!commitLine.isNullOrBlank()) {
+            dao.checkpointsOnce(projectId).firstOrNull { it.version == version }?.let { dao.putCheckpoint(it.copy(title = commitLine, dirty = true)) }
+        }
     }
 
     private suspend fun reply(projectId: String) {
@@ -365,39 +411,84 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val text = planReply.text
             var plan = PlanParser.parse(text)
 
-            if (plan.files.isEmpty()) {
+            if (plan.files.isEmpty() && plan.deletes.isEmpty()) {
+                if (plan.reads.isNotEmpty()) { answerFromFiles(projectId, request, plan.reads); return }
                 // A plain answer, or a model that ignored the format and sent code blocks anyway.
                 val found = CodeBlocks.files(text)
                 val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else text.ifBlank { "(empty reply)" }
                 addMsg(projectId, "assistant", shown)
-                if (found.isNotEmpty()) commit(projectId, found, request)
+                if (found.isNotEmpty()) commit(projectId, found, emptyList(), request)
                 return
             }
 
-            val hasPreview = dao.filesOnce(projectId).any { it.deletedAt == null && it.path == "preview.html" }
-            if (!hasPreview && plan.files.none { it.path == "preview.html" } && plan.files.any { it.path.endsWith(".kt") }) {
-                plan = plan.copy(files = plan.files + PlanFile("preview.html", "design preview of the main screen"))
+            val current = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+            val isNewApp = current.keys.none { it.endsWith(".kt") }
+
+            // App name: the AI picks one for a new app (or when asked to rename).
+            if (plan.appName.isNotBlank()) {
+                dao.project(projectId)?.let {
+                    dao.putProject(it.copy(name = plan.appName, updatedAt = System.currentTimeMillis(), dirty = true))
+                }
             }
-            addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change ${plan.files.size} files." })
+            // A new app always gets its own icon; preview.html always goes last.
+            val icons = if (isNewApp) {
+                listOf(Template.ICON_FG to "app icon artwork", Template.ICON_COLORS to "icon background color")
+                    .filter { (p, _) -> plan.files.none { it.path == p } }.map { PlanFile(it.first, it.second) }
+            } else emptyList()
+            val previewPlan = plan.files.firstOrNull { it.path == "preview.html" }
+            var files = plan.files.filter { it.path != "preview.html" } + icons
+            if (previewPlan != null || (current["preview.html"] == null && files.any { it.path.endsWith(".kt") })) {
+                files = files + (previewPlan ?: PlanFile("preview.html", "design preview of the main screen"))
+            }
+            plan = plan.copy(files = files)
+            val deletes = plan.deletes.filter { it in current }
 
-            steps = listOf(Step("Planned ${plan.files.size} file${if (plan.files.size == 1) "" else "s"}", 2)) +
-                plan.files.map { Step("Writing ${it.path.substringAfterLast('/')}", 0) } + Step("Saving version", 0)
+            addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change ${files.size + deletes.size} files." })
+            steps = listOf(Step("Planned ${files.size + deletes.size} change${if (files.size + deletes.size == 1) "" else "s"}", 2)) +
+                files.map { Step("Writing ${it.path.substringAfterLast('/')}", 0) } +
+                Step("Checking the code", 0) + Step("Saving version", 0)
+            val checkIdx = steps.size - 2
+            val saveIdx = steps.size - 1
 
-            val existing = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
             val written = linkedMapOf<String, String>()
             var failedAt: String? = null
-            for ((i, pf) in plan.files.withIndex()) {
+            for ((i, pf) in files.withIndex()) {
                 setStep(i + 1, 1)
-                val out = writeFile(projectId, pf, plan, request, existing, written)
+                val out = writeFile(projectId, pf, plan, request, current, written)
                 if (out == null) { setStep(i + 1, 3); failedAt = pf.path.substringAfterLast('/'); break }
                 written[pf.path] = out
                 setStep(i + 1, 2)
             }
+
+            // Check before saving: fix what the checker finds, at most two rounds.
+            var fixRounds = 0
+            var warnings = emptyList<String>()
             if (written.isNotEmpty()) {
-                val last = steps.lastIndex
-                setStep(last, 1)
-                commit(projectId, written.toList(), request)
-                setStep(last, 2)
+                setStep(checkIdx, 1)
+                fun state() = current.filterKeys { it !in deletes } + written
+                var issues = Lint.check(state())
+                while (issues.isNotEmpty() && fixRounds < 2) {
+                    val byPath = issues.filter { it.path in written }.groupBy { it.path }
+                    if (byPath.isEmpty()) break
+                    fixRounds++
+                    for ((p, list) in byPath.entries.take(3)) {
+                        val fixed = fixFile(projectId, p, written.getValue(p), list.map { it.text }, request) ?: continue
+                        written[p] = fixed
+                    }
+                    issues = Lint.check(state())
+                }
+                warnings = issues.map { "${it.path.substringAfterLast('/')}: ${it.text}" }
+                setStep(checkIdx, if (warnings.isEmpty()) 2 else 3)
+            }
+
+            if (written.isNotEmpty() || deletes.isNotEmpty()) {
+                setStep(saveIdx, 1)
+                val version = commit(projectId, written.toList(), deletes, request)
+                setStep(saveIdx, 2)
+                if (warnings.isNotEmpty()) {
+                    addMsg(projectId, "note", "Saved with warnings: " + warnings.take(3).joinToString("; "))
+                }
+                if (version != null) summarize(projectId, request, plan, written.keys.toList(), deletes, fixRounds, warnings, version)
             }
             if (failedAt != null) {
                 addMsg(projectId, "note", "Stopped at $failedAt." + if (written.isNotEmpty()) " The files before it were saved." else "")
@@ -412,25 +503,33 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     fun files(id: String) = dao.files(id)
     fun checkpoints(id: String) = dao.checkpoints(id)
 
-    /** Writes changed files and records one checkpoint. Returns (changed files, version) or null when nothing changed. */
-    private suspend fun saveFiles(projectId: String, found: List<Pair<String, String>>, title: String, model: String?): Pair<Int, Int>? {
-        if (found.isEmpty()) return null
+    /** Writes changed files, soft-deletes removed ones, and records one checkpoint. Null when nothing changed. */
+    private suspend fun saveFiles(
+        projectId: String, found: List<Pair<String, String>>, title: String, model: String?, deletes: List<String> = emptyList(),
+    ): Pair<Int, Int>? {
+        if (found.isEmpty() && deletes.isEmpty()) return null
         val now = System.currentTimeMillis()
-        val existing = dao.filesOnce(projectId).associateBy { it.path }
+        val rows = dao.filesOnce(projectId)
+        val existing = rows.associateBy { it.path }
         val changed = found.filter { (path, content) ->
             val old = existing[path]
             old == null || old.deletedAt != null || old.content != content
         }
-        if (changed.isEmpty()) return null
+        val gone = deletes.filter { existing[it]?.deletedAt == null && existing.containsKey(it) }
+        if (changed.isEmpty() && gone.isEmpty()) return null
         changed.forEach { (path, content) ->
             dao.putFile(FileEntity(CodeBlocks.fileId(projectId, path), projectId, path, content, now))
         }
+        gone.forEach { path -> existing[path]?.let { dao.putFile(it.copy(deletedAt = now, updatedAt = now, dirty = true)) } }
         val v = (dao.maxVersion(projectId) ?: 0) + 1
-        val changes = buildJsonObject { changed.forEach { (path, content) -> put(path, content) } }
+        val changes = buildJsonObject {
+            changed.forEach { (path, content) -> put(path, content) }
+            gone.forEach { put("__del:$it", "1") }
+        }
         dao.putCheckpoint(
             CheckpointEntity(CodeBlocks.checkpointId(projectId, v), projectId, v, title.take(60), model, changes.toString(), now)
         )
-        return changed.size to v
+        return (changed.size + gone.size) to v
     }
 
     /** Puts the project back to how it was at [version]; the restore itself becomes a new version. */
@@ -440,7 +539,13 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             dao.checkpointsOnce(projectId).filter { it.version <= version }.forEach { cp ->
                 val o = Json.parseToJsonElement(cp.changes).jsonObject
                 if (o.containsKey("__full")) state.clear()
-                o.forEach { (k, v) -> if (k != "__full") state[k] = v.jsonPrimitive.content }
+                o.forEach { (k, v) ->
+                    when {
+                        k == "__full" -> {}
+                        k.startsWith("__del:") -> state.remove(k.removePrefix("__del:"))
+                        else -> state[k] = v.jsonPrimitive.content
+                    }
+                }
             }
             val now = System.currentTimeMillis()
             dao.filesOnce(projectId).forEach { f ->
@@ -468,6 +573,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     fun ghRepo(id: String) = prefs.getString("gh_repo_$id", "") ?: ""
     fun ghBranch(id: String) = prefs.getString("gh_branch_$id", "main") ?: "main"
 
+    fun lastPublished(id: String) = prefs.getInt("gh_pub_ver_$id", 0)
+
     fun publish(projectId: String, repo: String, branch: String, commitMsg: String, tokenInput: String) {
         viewModelScope.launch {
             pubStage = 1; pubInfo = null; runUrl = null; buildErrors = null
@@ -477,9 +584,15 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 }
                 val token = store.ghToken() ?: error("Enter your GitHub token.")
                 val proj = dao.project(projectId) ?: error("Open a project first.")
-                val own = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
-                val sha = GitHub.push(token, repo.trim(), branch.trim(), commitMsg.ifBlank { "Update from Vibecraft" }, Template.files(proj.name, projectId) + own)
-                prefs.edit().putString("gh_repo_$projectId", repo.trim()).putString("gh_branch_$projectId", branch.trim()).apply()
+                val rows = dao.filesOnce(projectId)
+                val own = rows.filter { it.deletedAt == null }.associate { it.path to it.content }
+                val gone = rows.filter { it.deletedAt != null && it.path !in own }.map { it.path }.toSet()
+                val sha = GitHub.push(
+                    token, repo.trim(), branch.trim(), commitMsg.ifBlank { "Update from Vibecraft" },
+                    Template.files(proj.name, projectId) + own, gone,
+                )
+                prefs.edit().putString("gh_repo_$projectId", repo.trim()).putString("gh_branch_$projectId", branch.trim())
+                    .putInt("gh_pub_ver_$projectId", dao.maxVersion(projectId) ?: 0).apply()
                 pubStage = 2
                 val run = GitHub.waitForRun(token, repo.trim(), sha)
                 runUrl = run.url
@@ -493,8 +606,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                pubInfo = e.message ?: "Publishing failed."
-                pubStage = 4
+                val m = e.message ?: "Publishing failed."
+                pubInfo = m
+                pubStage = if (m.startsWith("Nothing new")) 0 else 4
             }
         }
     }

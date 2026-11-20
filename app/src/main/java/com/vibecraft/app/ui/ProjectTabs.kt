@@ -28,6 +28,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.vibecraft.app.AppVm
 import com.vibecraft.app.data.FileEntity
+import com.vibecraft.app.gen.Template
 import kotlinx.coroutines.flow.flowOf
 
 @Composable
@@ -45,12 +46,12 @@ private fun filesOf(vm: AppVm, id: String?): List<FileEntity> {
     return list
 }
 
-/** Adds a viewport and zero margins so full-height layouts from the AI fill the phone frame. */
+/** The AI draws for a 260 x 500 screen. Fixing the page to that size avoids WebView laying it out against a zero-height viewport. */
 private fun prepared(html: String): String {
-    val head = "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>html,body{margin:0;min-height:100%}</style>"
-    val re = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
-    val match = re.find(html) ?: return head + html
-    return html.replaceRange(match.range, match.value + head)
+    val inject = "<meta name=\"viewport\" content=\"width=260,initial-scale=1\">" +
+        "<style>html,body{width:260px!important;height:500px!important;margin:0!important;overflow:hidden!important}</style>"
+    val i = html.indexOf("</head>", ignoreCase = true)
+    return if (i >= 0) html.substring(0, i) + inject + html.substring(i) else inject + html
 }
 
 @Composable
@@ -61,8 +62,9 @@ fun PreviewTab(vm: AppVm, projectId: String?) {
             Empty("No preview yet", "Describe an app in the chat. The AI adds a design preview here.")
         } else {
             val shape = RoundedCornerShape(30.dp)
+            // The frame is 14dp wider and taller than the page, so the 7dp border does not cover any of it.
             Box(
-                Modifier.align(Alignment.CenterHorizontally).width(260.dp).height(500.dp)
+                Modifier.align(Alignment.CenterHorizontally).width(274.dp).height(514.dp)
                     .clip(shape).border(7.dp, Color(0xFF10261B), shape).background(Color.White),
             ) {
                 AndroidView(
@@ -74,6 +76,7 @@ fun PreviewTab(vm: AppVm, projectId: String?) {
                             settings.allowFileAccess = false
                             settings.allowContentAccess = false
                             isVerticalScrollBarEnabled = false
+                            isHorizontalScrollBarEnabled = false
                         }
                     },
                     update = {
@@ -82,7 +85,7 @@ fun PreviewTab(vm: AppVm, projectId: String?) {
                             it.loadDataWithBaseURL(null, prepared(html), "text/html", "utf-8", null)
                         }
                     },
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.padding(7.dp).fillMaxSize().clip(RoundedCornerShape(23.dp)),
                 )
             }
             Note("Design preview only. The real app is built from the Kotlin files when you publish.")
@@ -171,7 +174,17 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
     val ctx = LocalContext.current
     var repo by remember(projectId) { mutableStateOf(projectId?.let { vm.ghRepo(it) } ?: "") }
     var branch by remember(projectId) { mutableStateOf(projectId?.let { vm.ghBranch(it) } ?: "main") }
-    var msg by remember { mutableStateOf("Update from Vibecraft") }
+    val cps by remember(projectId) { if (projectId != null) vm.checkpoints(projectId) else flowOf(emptyList<com.vibecraft.app.data.CheckpointEntity>()) }
+        .collectAsState(initial = emptyList())
+    val projects by vm.projects.collectAsState()
+    val slug = Template.slug(projects.firstOrNull { it.id == projectId }?.name ?: "app")
+    val suggestion = projectId?.let { id ->
+        val last = vm.lastPublished(id)
+        cps.filter { it.version > last }.reversed().joinToString("; ") { it.title }.take(72)
+    }.orEmpty().ifBlank { "Update from Vibecraft" }
+    var msg by remember { mutableStateOf(suggestion) }
+    var edited by remember { mutableStateOf(false) }
+    LaunchedEffect(suggestion) { if (!edited) msg = suggestion }
     var token by remember { mutableStateOf("") }
     val stage = vm.pubStage
     val running = stage == 1 || stage == 2
@@ -192,7 +205,7 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                 VcField(repo, { repo = it }, "Repository", "owner/name", mono = true, modifier = Modifier.weight(1f))
                 VcField(branch, { branch = it }, "Branch", "main", mono = true, modifier = Modifier.weight(1f))
             }
-            VcField(msg, { msg = it }, "Commit message")
+            VcField(msg, { msg = it; edited = true }, "Commit message")
             VcField(
                 token, { token = it }, "GitHub token",
                 if (vm.hasGhToken()) "Saved. Leave blank to keep it" else "ghp_… or github_pat_…", password = true, mono = true,
@@ -218,6 +231,9 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                 "Commit & push", { vm.publish(projectId, repo, branch, msg, token); token = "" },
                 Modifier.padding(top = 14.dp).fillMaxWidth(), enabled = !running, loading = running, icon = Ic.Up,
             )
+            if (stage == 0) vm.pubInfo?.let {
+                Text(it, color = c.mu, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
+            }
         }
         Spacer(Modifier.height(14.dp))
         VcCard {
@@ -227,7 +243,7 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
             StepRow(3, "APK ready", st(2))
             if (stage == 3) {
                 Text(
-                    "Open the build on GitHub, download vibecraft-debug-apk at the bottom, unzip it and install app-debug.apk.",
+                    "Open the build on GitHub, download $slug-apk at the bottom, unzip it and install $slug.apk.",
                     color = c.mu, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp, bottom = 8.dp),
                 )
                 VcButton(
