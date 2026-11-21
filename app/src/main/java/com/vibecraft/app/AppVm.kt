@@ -458,6 +458,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         ).any { it in l }
     }
 
+    /** A short "ok / do it / দাও" answer to something the AI proposed. */
+    private fun looksLikeConfirmation(t: String): Boolean {
+        val l = t.trim().lowercase()
+        return l.length <= 24 && listOf("দাও", "করো", "কর", "মুছো", "মুছে", "ঠিক আছে", "ওকে", "হ্যাঁ", "ok", "okay", "yes", "do it", "go ahead").any { it in l }
+    }
+
     private suspend fun reply(projectId: String) {
         thinkingId = projectId
         steps = listOf(Step("Reading your request", 1))
@@ -483,12 +489,13 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             }
             // A problem report answered with advice only: ask once more for the fix itself.
             if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isEmpty() &&
-                CodeBlocks.files(text).isEmpty() && looksLikeProblem(request)
+                CodeBlocks.files(text).isEmpty() && (looksLikeProblem(request) || looksLikeConfirmation(request))
             ) {
                 val again = askModel(
                     projectId, sys,
                     history + ("assistant" to text) +
-                        ("user" to "This is a problem report. Find the cause in the project files and fix it now: reply in the FILE format, or with READ lines if you need a file."),
+                        ("user" to if (looksLikeProblem(request)) "This is a problem report. Find the cause in the project files and fix it now: reply in the FILE format, or with READ lines if you need a file."
+                        else "The user confirmed. Do now what you proposed, in the FILE / DELETE format. If nothing needs to change, say so in one sentence."),
                 )
                 if (again != null) { text = again.text; plan = PlanParser.parse(text) }
             }
@@ -522,6 +529,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             }
             plan = plan.copy(files = files)
             val wantedDeletes = plan.deletes.filter { it in current }
+            plan.deletes.filter { it !in current }.forEach {
+                addMsg(projectId, "note", "${it.substringAfterLast('/')} is not in this project. If it only exists in your GitHub repository, it is removed automatically on the next publish.")
+            }
 
             addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change ${files.size + wantedDeletes.size} files." })
             val total = files.size + wantedDeletes.size
@@ -694,7 +704,13 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         val rows = dao.filesOnce(projectId)
         val own = rows.filter { it.deletedAt == null }.associate { it.path to it.content }
         val gone = rows.filter { it.deletedAt != null && it.path !in own }.map { it.path }.toSet()
-        val sha = GitHub.push(token, repo.trim(), branch.trim(), message.ifBlank { "Update from Vibecraft" }, Template.files(proj.name, projectId) + own, gone)
+        val sha = GitHub.push(
+            token, repo.trim(), branch.trim(), message.ifBlank { "Update from Vibecraft" },
+            Template.files(proj.name, projectId) + own, gone, listOf("${CodeBlocks.GEN}/", "app/src/main/res/"),
+        )
+        if (GitHub.lastPruned.isNotEmpty()) {
+            addMsg(projectId, "note", "Removed leftover files from the repository: " + GitHub.lastPruned.take(5).joinToString { it.substringAfterLast('/') })
+        }
         prefs.edit().putString("gh_repo_$projectId", repo.trim()).putString("gh_branch_$projectId", branch.trim())
             .putInt("gh_pub_ver_$projectId", dao.maxVersion(projectId) ?: 0).apply()
         return sha
@@ -718,7 +734,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val cur = files.getValue(path)
             val big = cur.length > FULL_FILE_LIMIT
             val ctx = buildString {
-                append("The GitHub build failed. Fix these compiler errors in ").append(path).append(". Change only what is needed.\n\nErrors:\n")
+                append("The GitHub build failed. Fix these compiler errors in ").append(path).append(". Change only what is needed.\n\n")
+                append("What every project file declares (use these exact names):\n").append(Manifest.render(Manifest.build(files))).append("\n\nErrors:\n")
                 errs.forEach { e ->
                     append("- line ").append(e.line ?: "?").append(": ").append(e.message).append('\n')
                     e.context.forEach { append("    ").append(it).append('\n') }
@@ -811,7 +828,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     /** Sends the build errors back to the AI so it can fix the code. */
     fun fixBuild(projectId: String) {
         val errs = buildErrors ?: return
-        send(projectId, "The GitHub build failed. Please fix the code and send the complete changed files. Errors:\n$errs")
+        send(projectId, "The GitHub build failed. Please fix these errors.\n$errs")
         pubStage = 0
     }
 

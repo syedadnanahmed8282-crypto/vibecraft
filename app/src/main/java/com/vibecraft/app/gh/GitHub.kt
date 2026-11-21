@@ -67,6 +67,10 @@ object GitHub {
     }
     private val json = Json { ignoreUnknownKeys = true }
 
+    /** Leftover files the last push removed from the repository. */
+    var lastPruned: List<String> = emptyList()
+        private set
+
     private fun obj(body: String): JsonObject? = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull()
 
     private suspend fun call(method: HttpMethod, token: String, path: String, body: JsonObject? = null): Res {
@@ -101,7 +105,7 @@ object GitHub {
         obj(r.body)!!["object"]!!.jsonObject["sha"]!!.jsonPrimitive.content
 
     /** Creates one commit holding all files on top of the branch. Returns the new commit sha. */
-    suspend fun push(token: String, repo: String, branch: String, message: String, files: Map<String, String>, deletes: Set<String> = emptySet()): String {
+    suspend fun push(token: String, repo: String, branch: String, message: String, files: Map<String, String>, deletes: Set<String> = emptySet(), managed: List<String> = emptyList()): String {
         if (!Regex("^[\\w.-]+/[\\w.-]+$").matches(repo)) throw GhError("Enter the repository as owner/name.")
         var br = branch.ifBlank { "main" }
         var ref = call(HttpMethod.Get, token, "/repos/$repo/git/ref/heads/$br")
@@ -147,7 +151,10 @@ object GitHub {
             }
         }
         val send = if (complete) files.filter { (p, c) -> remote[p] != blobSha(c) } else files
-        val remove = if (complete) deletes.filter { it in remote } else emptyList()
+        // Leftovers: files in the folders Vibecraft manages that this project no longer has (for example from an older app in the same repository).
+        val stale = if (complete) remote.keys.filter { k -> k !in files && managed.any { k.startsWith(it) } } else emptyList()
+        lastPruned = stale
+        val remove = if (complete) (deletes.filter { it in remote } + stale).distinct() else emptyList()
         if (send.isEmpty() && remove.isEmpty()) throw GhError("Nothing new to publish. Your repository already has these files.")
         val tree = call(HttpMethod.Post, token, "/repos/$repo/git/trees", buildJsonObject {
             put("base_tree", baseTree)

@@ -10,6 +10,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.*
@@ -93,7 +94,7 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpened: (String) 
                                 Modifier.widthIn(max = 300.dp)
                                     .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp)).background(c.g)
                                     .padding(horizontal = 14.dp, vertical = 10.dp),
-                            ) { Text(m.content, color = Color.White, fontSize = 14.5.sp) }
+                            ) { UserText(m.content) }
                         }
                     }
                 }
@@ -280,5 +281,19 @@ private fun FileCard(content: String) {
             Text(path.substringBeforeLast('/', ""), color = c.mu, fontSize = 10.5.sp, maxLines = 1)
         }
         Chip(status, active = status == "created")
+    }
+}
+
+/** Long messages, such as build errors sent to the AI, are shortened until the user opens them. */
+@Composable
+private fun UserText(t: String) {
+    var open by remember { mutableStateOf(false) }
+    val long = t.length > 360
+    Column {
+        Text(if (long && !open) t.take(300).trimEnd() + "…" else t, color = Color.White, fontSize = 14.5.sp)
+        if (long) Text(
+            if (open) "Show less" else "Show more", color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.clickable { open = !open }.padding(top = 6.dp),
+        )
     }
 }

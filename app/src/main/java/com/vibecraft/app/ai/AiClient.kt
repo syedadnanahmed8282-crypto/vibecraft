@@ -66,6 +66,10 @@ object AiClient {
         "When the user reports a problem or something that does not work (the preview, the look, a missing feature, an error), " +
         "find the cause in the project files and FIX it with FILE lines in the same reply, saying the cause and the fix in SUMMARY; " +
         "do not only explain and do not give general advice. If you need a file you cannot see, reply with READ lines first. " +
+        "A short confirmation from the user (such as ok, do it, দাও, মুছো) means: do now what you proposed, with FILE or DELETE lines. " +
+        "Never say that you are changing or deleting something unless the same reply has the matching FILE or DELETE lines. " +
+        "A build error that names a file missing from the manifest comes from a leftover file in the GitHub repository; " +
+        "Vibecraft removes such files on the next publish, so do not try to delete them. " +
         "The project manifest below lists every file with its purpose, the files it uses, its size and its version. Only some files are " +
         "shown in full; files marked INCOMPLETE are shown in part. Never rewrite an INCOMPLETE file as a whole. " +
         "If the user asks to read, explain, review or find something in the code, do NOT write files: answer directly when the file " +
