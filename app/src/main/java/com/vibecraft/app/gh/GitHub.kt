@@ -7,11 +7,16 @@ import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsBytes
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
+import com.vibecraft.app.gen.BuildLog
+import com.vibecraft.app.gen.BuildReport
+import com.vibecraft.app.gen.BuildStatus
+import com.vibecraft.app.gen.LogZip
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -30,6 +35,13 @@ class GhError(message: String) : Exception(message)
 
 class Res(val code: Int, val body: String)
 
+/** Raw bytes of a response (log archives are ZIP files, not text). */
+class Raw(val code: Int, val bytes: ByteArray) {
+    val text: String get() = bytes.toString(Charsets.UTF_8)
+}
+
+class LogFetch(val text: String?, val problem: String?)
+
 data class RunInfo(val id: Long, val url: String, val conclusion: String?)
 
 /** Minimal GitHub REST client: one atomic commit per publish, then watches the Actions build. */
@@ -40,6 +52,16 @@ object GitHub {
                 requestTimeoutMillis = 90_000
                 connectTimeoutMillis = 20_000
                 socketTimeoutMillis = 90_000
+            }
+        }
+    }
+    private val plain by lazy {
+        HttpClient(OkHttp) {
+            followRedirects = false
+            install(HttpTimeout) {
+                requestTimeoutMillis = 120_000
+                connectTimeoutMillis = 20_000
+                socketTimeoutMillis = 120_000
             }
         }
     }
@@ -188,19 +210,71 @@ object GitHub {
         throw GhError("The build is taking too long. Check GitHub Actions.")
     }
 
-    /** Pulls the useful error lines out of the failed job's log. */
-    suspend fun failureSummary(token: String, repo: String, runId: Long): String {
-        val jobs = call(HttpMethod.Get, token, "/repos/$repo/actions/runs/$runId/jobs")
-        val arr = obj(jobs.body)?.get("jobs")?.jsonArray ?: return "The build failed."
-        val job = arr.map { it.jsonObject }.firstOrNull { it["conclusion"]?.jsonPrimitive?.contentOrNull == "failure" }
-            ?: return "The build failed."
-        val log = call(HttpMethod.Get, token, "/repos/$repo/actions/jobs/${job["id"]!!.jsonPrimitive.long}/logs")
-        if (log.code != 200) return "The build failed. Open the run on GitHub to read the log."
-        val lines = log.body.lines().map { it.replace(Regex("^\\S+Z\\s"), "") }
-        val errs = lines.filter {
-            it.startsWith("e: ") || it.contains("error:") || it.startsWith("FAILURE") ||
-                it.contains("What went wrong") || it.contains("Execution failed")
+    /** Downloads a GitHub log endpoint: the API answers with a redirect to a signed address, which is fetched without our token. */
+    private suspend fun download(token: String, path: String): Raw {
+        return try {
+            val first = plain.request("https://api.github.com$path") {
+                this.method = HttpMethod.Get
+                header(HttpHeaders.Authorization, "Bearer $token")
+                header(HttpHeaders.Accept, "application/vnd.github+json")
+                header("X-GitHub-Api-Version", "2022-11-28")
+                header(HttpHeaders.UserAgent, "Vibecraft")
+            }
+            val code = first.status.value
+            if (code in 301..308) {
+                val loc = first.headers[HttpHeaders.Location] ?: return Raw(502, ByteArray(0))
+                val second = plain.request(loc) { this.method = HttpMethod.Get; header(HttpHeaders.UserAgent, "Vibecraft") }
+                Raw(second.status.value, second.bodyAsBytes())
+            } else Raw(code, first.bodyAsBytes())
+        } catch (e: Exception) {
+            throw GhError("Network problem: ${e.message ?: "could not reach GitHub"}")
         }
-        return (if (errs.isNotEmpty()) errs else lines.takeLast(25)).take(40).joinToString("\n") { it.take(300) }
+    }
+
+    private fun problemFor(code: Int, body: String): String {
+        val low = body.lowercase()
+        return when {
+            code == 429 || "rate limit" in low -> "GitHub is limiting requests right now (rate limit). Wait a few minutes and try again."
+            code == 401 -> "GitHub rejected the token (401), so the build log cannot be read."
+            code == 403 -> "The token is not allowed to read build logs (403). It needs the Actions: read permission."
+            code == 404 || code == 410 -> "The build logs are not available (missing or expired)."
+            else -> "GitHub error $code while downloading the build log."
+        }
+    }
+
+    /** The log of the failed job (plain text) first, then the whole run as a ZIP archive. */
+    suspend fun fetchLogs(token: String, repo: String, runId: Long): LogFetch {
+        val jobs = call(HttpMethod.Get, token, "/repos/$repo/actions/runs/$runId/jobs")
+        if (jobs.code == 401 || jobs.code == 403 || jobs.code == 429) return LogFetch(null, problemFor(jobs.code, jobs.body))
+        val failed = obj(jobs.body)?.get("jobs")?.jsonArray?.map { it.jsonObject }
+            ?.firstOrNull { it["conclusion"]?.jsonPrimitive?.contentOrNull == "failure" }
+        if (failed != null) {
+            val log = download(token, "/repos/$repo/actions/jobs/${failed["id"]!!.jsonPrimitive.long}/logs")
+            if (log.code == 200 && log.bytes.isNotEmpty()) return LogFetch(log.text, null)
+        }
+        val zip = download(token, "/repos/$repo/actions/runs/$runId/logs")
+        if (zip.code != 200) return LogFetch(null, problemFor(zip.code, zip.text))
+        val text = LogZip.extract(zip.bytes) ?: return LogFetch(null, "The log archive could not be read (corrupt or empty ZIP).")
+        return LogFetch(text, null)
+    }
+
+    /** Success, failure with the real errors, unreadable log, or an unclear result: each is reported separately. */
+    suspend fun analyze(token: String, repo: String, run: RunInfo): BuildReport {
+        return when (run.conclusion) {
+            "success" -> BuildReport(BuildStatus.SUCCESS, runUrl = run.url)
+            "failure" -> {
+                val f = fetchLogs(token, repo, run.id)
+                if (f.text == null) BuildReport(BuildStatus.EXTRACTION_FAILED, note = f.problem ?: "The build log could not be read.", runUrl = run.url)
+                else {
+                    val errors = BuildLog.parse(f.text)
+                    if (errors.isEmpty()) BuildReport(
+                        BuildStatus.INCONCLUSIVE,
+                        note = "The build failed but no known error pattern was found. Last lines of the log:\n" + BuildLog.tail(f.text),
+                        runUrl = run.url,
+                    ) else BuildReport(BuildStatus.FAILED, errors, runUrl = run.url)
+                }
+            }
+            else -> BuildReport(BuildStatus.INCONCLUSIVE, note = "The run ended as '${run.conclusion ?: "unknown"}'.", runUrl = run.url)
+        }
     }
 }

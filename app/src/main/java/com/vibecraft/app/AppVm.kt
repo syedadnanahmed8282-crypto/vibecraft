@@ -12,6 +12,7 @@ import com.vibecraft.app.ai.Fallback
 import com.vibecraft.app.ai.Reply
 import com.vibecraft.app.ai.TimedOut
 import com.vibecraft.app.ai.Profile
+import com.vibecraft.app.ai.ProfileValidation
 import com.vibecraft.app.ai.ProfileStore
 import com.vibecraft.app.data.CheckpointEntity
 import com.vibecraft.app.data.FileEntity
@@ -19,13 +20,23 @@ import com.vibecraft.app.data.MessageEntity
 import com.vibecraft.app.data.ProjectEntity
 import com.vibecraft.app.data.SyncRepo
 import com.vibecraft.app.ui.ThemeMode
+import com.vibecraft.app.gen.BuildError
+import com.vibecraft.app.gen.BuildLog
+import com.vibecraft.app.gen.BuildReport
+import com.vibecraft.app.gen.BuildStatus
 import com.vibecraft.app.gen.CodeBlocks
+import com.vibecraft.app.gen.ContextSelector
+import com.vibecraft.app.gen.EditResult
+import com.vibecraft.app.gen.Manifest
+import com.vibecraft.app.gen.Protect
+import com.vibecraft.app.gen.Reader
 import com.vibecraft.app.gen.Edits
 import com.vibecraft.app.gen.Lint
 import com.vibecraft.app.gen.Plan
 import com.vibecraft.app.gen.PlanFile
 import com.vibecraft.app.gen.PlanParser
 import com.vibecraft.app.gen.Template
+import com.vibecraft.app.gh.GhError
 import com.vibecraft.app.gh.GitHub
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.providers.builtin.Email
@@ -42,6 +53,12 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.UUID
+
+/** Longest file that is shown and rewritten whole; longer files are edited in parts only. */
+private const val FULL_FILE_LIMIT = 24_000
+
+/** Most AI requests one build-and-repair task may use. */
+private const val REPAIR_BUDGET = 10
 
 /** One line in the live progress card. state: 0 waiting, 1 running, 2 done, 3 failed. */
 data class Step(val label: String, val state: Int)
@@ -93,6 +110,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     /** Returns an error text, or null when saved. A blank key keeps the stored one. */
     fun saveProfile(p: Profile, key: String): String? {
+        ProfileValidation.checkUrl(p.baseUrl)?.let { return it }
         if (key.isNotBlank()) {
             if (!store.secure()) return "Secure storage is not available on this phone, so the key cannot be saved."
             store.putKey(p.id, key.trim())
@@ -232,38 +250,42 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     // ---- AI work: plan, read, write one file at a time, check, save, summarize ----
     var steps by mutableStateOf<List<Step>>(emptyList()); private set
+    private var aiCalls = 0
 
     private fun setStep(i: Int, state: Int) {
         steps = steps.mapIndexed { j, st -> if (j == i) Step(st.label, state) else st }
     }
 
-    /** What the AI is told about the project: the code files when they fit, otherwise just the list. */
-    private suspend fun snapshotOf(projectId: String): String {
-        val fs = dao.filesOnce(projectId).filter { it.deletedAt == null }
-        if (fs.isEmpty()) return "The project has no files yet."
-        val sketch = fs.firstOrNull { it.path == "preview.html" }
-        val code = fs.filter { it.path != "preview.html" }
-        val body = if (code.sumOf { it.content.length } <= 16_000) code.joinToString("\n\n") { "--- ${it.path}\n${it.content}" }
-        else code.joinToString("\n") { "${it.path} (${it.content.length} characters)" } + "\n(contents not shown: use READ lines for the files you need)"
-        val tail = if (sketch != null) "\n\npreview.html: the design sketch, ${sketch.content.length} characters, not shown (use READ if you need it)" else ""
-        return body + tail
-    }
+    /** What the AI is told about the project: a manifest plus only the files that matter for this request. */
+    private fun contextOf(files: Map<String, String>, request: String, recent: List<String>): String =
+        if (files.isEmpty()) "The project has no files yet." else ContextSelector.select(request, recent, files).render()
 
     /** Asks the active model and moves to the next profile when one is out of quota. Null means it could not answer. */
     private suspend fun askModel(projectId: String, system: String, msgs: List<Pair<String, String>>, quiet: Boolean = false): Reply? {
         suspend fun say(t: String) { if (!quiet) addMsg(projectId, "note", t) }
         val usable = profiles.filter { store.key(it.id) != null }
-        val first = usable.firstOrNull { it.id == activeId }
-        val order = listOfNotNull(first) + usable.filter { it !== first }
-        if (order.isEmpty()) {
+        val ready = usable.filter { it.dailyLimit <= 0 || store.used(it.id) < it.dailyLimit }
+        val active = usable.firstOrNull { it.id == activeId }
+        if (usable.isEmpty()) {
             say("Add an AI profile with an API key in Settings to get replies.")
             return null
         }
+        if (ready.isEmpty()) {
+            say("Every AI profile has reached its daily request limit. Raise the limit in Settings or try tomorrow.")
+            return null
+        }
+        if (active != null && active !in ready) {
+            if (!autoSwitch) { say("${active.name} reached its daily limit (${active.dailyLimit}). Auto-switch is off."); return null }
+            say("${active.name} reached its daily limit. Switched to ${ready.first().name} automatically.")
+        }
+        val first = ready.firstOrNull { it.id == activeId }
+        val order = listOfNotNull(first) + ready.filter { it !== first }
         var i = 0
         var retried = false
         while (i < order.size) {
             val p = order[i]
             try {
+                aiCalls++
                 val r = AiClient.chatFull(p, store.key(p.id)!!, msgs, system)
                 store.addUsage(p.id)
                 activeId = p.id; store.setActive(p.id)
@@ -308,9 +330,13 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return body?.let { CodeBlocks.dropPathLine(it).trimEnd('\n') + "\n" }
     }
 
-    /** Asks for one file (new, or changed parts only) and returns its final text. Null means it could not. */
-    private suspend fun produce(projectId: String, path: String, cur: String?, ctx: String): String? {
+    /**
+     * Asks for one file (new, or changed parts only) and returns its final text. Null means it could not.
+     * mustEdit: the AI saw only part of the file, so a whole-file rewrite is refused.
+     */
+    private suspend fun produce(projectId: String, path: String, cur: String?, ctx: String, mustEdit: Boolean = false): String? {
         val name = path.substringAfterLast('/')
+        val base = cur?.let { Manifest.hash(it) }
         val r = askModel(projectId, AiClient.SYS_FILE, listOf("user" to ctx)) ?: return null
         var body = codeOf(r)
         if (body == null) {
@@ -318,16 +344,31 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             return null
         }
         if (Edits.isEdit(body)) {
-            val applied = if (cur != null) Edits.apply(cur, body) else null
-            if (applied != null) return CodeBlocks.normalize(path, applied).second
-            val r2 = askModel(projectId, AiClient.SYS_FILE, listOf("user" to (ctx + "\n\nYour edit did not match the file. Send the complete new file in one code block instead."))) ?: return null
+            val res = if (cur != null) Edits.apply(cur, body, base) else EditResult(null, "The file does not exist yet, so edits cannot be applied.")
+            if (res.text != null) return CodeBlocks.normalize(path, res.text).second
+            if (mustEdit) {
+                addMsg(projectId, "note", "Could not apply the change to $name (${res.error}). The file is long, so it was not rewritten.")
+                return null
+            }
+            val r2 = askModel(projectId, AiClient.SYS_FILE, listOf("user" to (ctx + "\n\nYour edit could not be applied (${res.error}). Send the complete new file in one code block instead."))) ?: return null
             body = codeOf(r2)
             if (body == null || Edits.isEdit(body)) {
                 addMsg(projectId, "note", "Could not apply the change to $name.")
                 return null
             }
+        } else if (mustEdit && cur != null) {
+            addMsg(projectId, "note", "Rejected a whole-file rewrite of $name because only part of the file was shown. Ask for a smaller change.")
+            return null
         }
         return CodeBlocks.normalize(path, body).second
+    }
+
+    /** The visible start of a long file, cut at a line boundary. */
+    private fun visibleHead(text: String): Pair<String, Int> {
+        var used = 0
+        var n = 0
+        for (l in text.lines()) { if (used + l.length + 1 > FULL_FILE_LIMIT) break; used += l.length + 1; n++ }
+        return text.lines().take(n).joinToString("\n") to n
     }
 
     private suspend fun writeFile(
@@ -336,6 +377,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     ): String? {
         val isPreview = pf.path == "preview.html"
         val cur = if (isPreview) null else (written[pf.path] ?: existing[pf.path])
+        val tooBig = cur != null && cur.length > FULL_FILE_LIMIT
         val others = (existing.keys + written.keys).filter { it != pf.path }
         val ctx = buildString {
             append("What the user asked:\n").append(request).append("\n\nPlan: ").append(plan.summary).append("\nFiles in this change:\n")
@@ -350,17 +392,24 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 ui.forEach { (p, c) -> append("\nExisting screen ").append(p).append(":\n```\n").append(c.take(3000)).append("\n```\n") }
                 append("\nWrite a fresh, compact preview (under 150 lines) of the app's main screen as it looks after this change, ")
                 append("with its features visible. It replaces the old preview.")
+            } else if (cur != null && tooBig) {
+                val (head, n) = visibleHead(cur)
+                append("\n\nIts current content is INCOMPLETE (lines 1-$n of ${cur.lines().size}; the rest is not shown). Send edit blocks only, for the visible part:\n```\n")
+                append(head).append("\n```")
             } else if (cur != null) append("\n\nIts current content:\n```\n").append(cur).append("\n```") else append("\n\nIt is a new file.")
         }
-        return produce(projectId, pf.path, cur, ctx)
+        return produce(projectId, pf.path, cur, ctx, mustEdit = tooBig)
     }
 
     /** Repairs a file the checker found problems in, changing only what is needed. */
     private suspend fun fixFile(projectId: String, path: String, content: String, problems: List<String>, request: String): String? {
+        val big = content.length > FULL_FILE_LIMIT
+        val shown = if (big) visibleHead(content).first else content
         val ctx = "What the user asked:\n$request\n\nThis file has problems that would break the build:\n" +
             problems.joinToString("\n") { "- $it" } +
-            "\n\nFix only these problems. Current content of $path:\n```\n$content\n```\nSend edit blocks (preferred) or the complete file."
-        return produce(projectId, path, content, ctx)
+            "\n\nFix only these problems. Current content of $path" + (if (big) " (INCOMPLETE, edit blocks only)" else "") +
+            ":\n```\n$shown\n```\nSend edit blocks (preferred) or the complete file."
+        return produce(projectId, path, content, ctx, mustEdit = big)
     }
 
     /** Saves the files as one version, adds a card per changed file to the chat, and returns the version. */
@@ -415,18 +464,20 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         try {
             val all = dao.messagesOnce(projectId)
             val request = all.lastOrNull { it.role == "user" }?.content ?: ""
-            val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(12).map { it.role to it.content }
-            val sys = AiClient.SYS_PLAN + "\n\nCurrent project files:\n" + snapshotOf(projectId)
+            val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(6).map { it.role to it.content }
+            val recentUser = all.filter { it.role == "user" }.takeLast(3).map { it.content }
+            val current = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+            val baseHash = current.mapValues { Manifest.hash(it.value) }
+            val sys = AiClient.SYS_PLAN + "\n\n" + contextOf(current, request, recentUser)
             val planReply = askModel(projectId, sys, history) ?: return
             var text = planReply.text
             var plan = PlanParser.parse(text)
 
-            // The AI asked to look at files first: give it their contents and let it plan again.
+            // The AI asked to look at files (or parts of long files) first: give it exactly that and let it plan again.
             if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isNotEmpty()) {
                 steps = listOf(Step("Reading ${plan.reads.size} file${if (plan.reads.size == 1) "" else "s"}", 1))
-                val have = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
-                val ctxFiles = plan.reads.mapNotNull { p -> have[p]?.let { "--- $p\n${it.take(14_000)}" } }.joinToString("\n\n")
-                val second = askModel(projectId, sys + "\n\nFiles you asked to read:\n" + ctxFiles, history) ?: return
+                val chunks = plan.reads.mapNotNull { r -> current[r.path]?.let { Reader.chunk(r.path, it, r.from, r.to) } }.joinToString("\n\n")
+                val second = askModel(projectId, sys + "\n\nFiles you asked to read:\n" + chunks.ifBlank { "(none of those files exist)" }, history) ?: return
                 text = second.text
                 plan = PlanParser.parse(text)
             }
@@ -444,14 +495,13 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
             if (plan.files.isEmpty() && plan.deletes.isEmpty()) {
                 // A plain answer, or a model that ignored the format and sent code blocks anyway.
-                val found = CodeBlocks.files(text)
+                val found = CodeBlocks.files(text).filter { Protect.canWrite(it.first) }
                 val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else text.ifBlank { "(empty reply)" }
                 addMsg(projectId, "assistant", shown)
                 if (found.isNotEmpty()) commit(projectId, found, emptyList(), request)
                 return
             }
 
-            val current = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
             val isNewApp = current.keys.none { it.endsWith(".kt") }
 
             // App name: the AI picks one for a new app (or when asked to rename).
@@ -471,10 +521,11 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 files = files + (previewPlan ?: PlanFile("preview.html", "design preview of the main screen"))
             }
             plan = plan.copy(files = files)
-            val deletes = plan.deletes.filter { it in current }
+            val wantedDeletes = plan.deletes.filter { it in current }
 
-            addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change ${files.size + deletes.size} files." })
-            steps = listOf(Step("Planned ${files.size + deletes.size} change${if (files.size + deletes.size == 1) "" else "s"}", 2)) +
+            addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change ${files.size + wantedDeletes.size} files." })
+            val total = files.size + wantedDeletes.size
+            steps = listOf(Step("Planned $total change${if (total == 1) "" else "s"}", 2)) +
                 files.map { Step("Writing ${it.path.substringAfterLast('/')}", 0) } +
                 Step("Checking the code", 0) + Step("Saving version", 0)
             val checkIdx = steps.size - 2
@@ -493,6 +544,15 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 }
                 written[pf.path] = out
                 setStep(i + 1, 2)
+            }
+
+            // Deleting is destructive: keep a file when something that stays still uses it.
+            val after = current + written
+            val deletes = mutableListOf<String>()
+            for (d in wantedDeletes) {
+                val blockers = Protect.deleteBlockers(d, after).filter { it !in wantedDeletes }
+                if (blockers.isEmpty()) deletes.add(d)
+                else addMsg(projectId, "note", "Did not delete ${d.substringAfterLast('/')}: still used by ${blockers.take(3).joinToString { it.substringAfterLast('/') }}.")
             }
 
             // Check before saving: fix what the checker finds, at most two rounds.
@@ -514,6 +574,14 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 }
                 warnings = issues.map { "${it.path.substringAfterLast('/')}: ${it.text}" }
                 setStep(checkIdx, if (warnings.isEmpty()) 2 else 3)
+            }
+
+            // Stale check: a file that changed while the AI worked on it must not be overwritten.
+            val latest = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+            val stale = written.keys.filter { k -> baseHash[k] != null && latest[k] != null && Manifest.hash(latest.getValue(k)) != baseHash.getValue(k) }
+            if (stale.isNotEmpty()) {
+                stale.forEach { written.remove(it) }
+                addMsg(projectId, "note", "Skipped ${stale.joinToString { it.substringAfterLast('/') }}: it changed while the AI was working.")
             }
 
             if (written.isNotEmpty() || deletes.isNotEmpty()) {
@@ -610,33 +678,124 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     fun lastPublished(id: String) = prefs.getInt("gh_pub_ver_$id", 0)
 
+    var buildReport by mutableStateOf<BuildReport?>(null); private set
+    var repairInfo by mutableStateOf<String?>(null); private set
+    var repairMax by mutableStateOf(prefs.getInt("repair_max", 2)); private set
+
+    @JvmName("updateRepairMax")
+    fun setRepairMax(n: Int) {
+        repairMax = n.coerceIn(0, 3)
+        prefs.edit().putInt("repair_max", repairMax).apply()
+    }
+
+    /** Sends the project (plus Vibecraft's build files) to GitHub and returns the commit. */
+    private suspend fun pushNow(projectId: String, token: String, repo: String, branch: String, message: String): String {
+        val proj = dao.project(projectId) ?: error("Open a project first.")
+        val rows = dao.filesOnce(projectId)
+        val own = rows.filter { it.deletedAt == null }.associate { it.path to it.content }
+        val gone = rows.filter { it.deletedAt != null && it.path !in own }.map { it.path }.toSet()
+        val sha = GitHub.push(token, repo.trim(), branch.trim(), message.ifBlank { "Update from Vibecraft" }, Template.files(proj.name, projectId) + own, gone)
+        prefs.edit().putString("gh_repo_$projectId", repo.trim()).putString("gh_branch_$projectId", branch.trim())
+            .putInt("gh_pub_ver_$projectId", dao.maxVersion(projectId) ?: 0).apply()
+        return sha
+    }
+
+    private fun window(text: String, line: Int?, radius: Int): String {
+        val ls = text.lines()
+        val c = (line ?: 1).coerceIn(1, ls.size)
+        val from = maxOf(1, c - radius)
+        val to = minOf(ls.size, c + radius)
+        return (from..to).joinToString("\n") { "%4d| %s".format(it, ls[it - 1]) }
+    }
+
+    /** One repair round: fix the files named in the errors, check them, and save a version. False when nothing safe came out. */
+    private suspend fun repairOnce(projectId: String, errors: List<BuildError>, round: Int): Boolean {
+        val files = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+        val byFile = errors.filter { it.file != null && files.containsKey(it.file) && Protect.canWrite(it.file) }.groupBy { it.file!! }
+        if (byFile.isEmpty()) return false
+        val fixed = linkedMapOf<String, String>()
+        for ((path, errs) in byFile.entries.take(3)) {
+            val cur = files.getValue(path)
+            val big = cur.length > FULL_FILE_LIMIT
+            val ctx = buildString {
+                append("The GitHub build failed. Fix these compiler errors in ").append(path).append(". Change only what is needed.\n\nErrors:\n")
+                errs.forEach { e ->
+                    append("- line ").append(e.line ?: "?").append(": ").append(e.message).append('\n')
+                    e.context.forEach { append("    ").append(it).append('\n') }
+                }
+                append("\nCode around the first error (line numbers are for reference only and are not part of the code):\n")
+                append(window(cur, errs.first().line, 8))
+                append("\n\nCurrent content of ").append(path).append(if (big) " (INCOMPLETE, edit blocks only)" else "").append(":\n```\n")
+                append(if (big) visibleHead(cur).first else cur).append("\n```")
+            }
+            produce(projectId, path, cur, ctx, mustEdit = big)?.let { fixed[path] = it }
+        }
+        if (fixed.isEmpty()) return false
+        // Check before anything is pushed.
+        var issues = Lint.check(files + fixed).filter { it.path in fixed }
+        if (issues.isNotEmpty()) {
+            for ((p, list) in issues.groupBy { it.path }.entries.take(3)) {
+                fixFile(projectId, p, fixed.getValue(p), list.map { it.text }, "Fix the build errors")?.let { fixed[p] = it }
+            }
+            issues = Lint.check(files + fixed).filter { it.path in fixed }
+            if (issues.isNotEmpty()) return false
+        }
+        val saved = saveFiles(projectId, fixed.toList(), "Fix build errors (round $round)", activeName) ?: return false
+        fixed.keys.forEach { addMsg(projectId, "note", "FILE|updated|$it") }
+        addMsg(projectId, "note", "Auto-fixed build errors · v${saved.second}")
+        return true
+    }
+
     fun publish(projectId: String, repo: String, branch: String, commitMsg: String, tokenInput: String) {
         viewModelScope.launch {
-            pubStage = 1; pubInfo = null; runUrl = null; buildErrors = null
+            pubStage = 1; pubInfo = null; runUrl = null; buildErrors = null; buildReport = null; repairInfo = null
             try {
                 if (tokenInput.isNotBlank() && !store.setGhToken(tokenInput.trim())) {
                     error("Secure storage is not available on this phone, so the token cannot be saved.")
                 }
                 val token = store.ghToken() ?: error("Enter your GitHub token.")
-                val proj = dao.project(projectId) ?: error("Open a project first.")
-                val rows = dao.filesOnce(projectId)
-                val own = rows.filter { it.deletedAt == null }.associate { it.path to it.content }
-                val gone = rows.filter { it.deletedAt != null && it.path !in own }.map { it.path }.toSet()
-                val sha = GitHub.push(
-                    token, repo.trim(), branch.trim(), commitMsg.ifBlank { "Update from Vibecraft" },
-                    Template.files(proj.name, projectId) + own, gone,
-                )
-                prefs.edit().putString("gh_repo_$projectId", repo.trim()).putString("gh_branch_$projectId", branch.trim())
-                    .putInt("gh_pub_ver_$projectId", dao.maxVersion(projectId) ?: 0).apply()
-                pubStage = 2
-                val run = GitHub.waitForRun(token, repo.trim(), sha)
-                runUrl = run.url
-                if (run.conclusion == "success") {
-                    pubStage = 3
-                } else {
-                    buildErrors = GitHub.failureSummary(token, repo.trim(), run.id)
-                    pubInfo = "The build failed."
-                    pubStage = 4
+                var sha = pushNow(projectId, token, repo, branch, commitMsg)
+                val startCalls = aiCalls
+                var round = 0
+                while (true) {
+                    pubStage = 2
+                    val run = GitHub.waitForRun(token, repo.trim(), sha)
+                    runUrl = run.url
+                    val report = GitHub.analyze(token, repo.trim(), run)
+                    buildReport = report
+                    if (report.status == BuildStatus.SUCCESS) { pubStage = 3; repairInfo = null; break }
+                    buildErrors = BuildLog.render(report.errors).ifBlank { null }
+                    val fixable = report.status == BuildStatus.FAILED && report.errors.any { it.file != null && Protect.canWrite(it.file) }
+                    if (!fixable || round >= repairMax) {
+                        pubInfo = when {
+                            report.status != BuildStatus.FAILED -> report.note
+                            round > 0 -> "Auto-fix stopped after $round round${if (round == 1) "" else "s"}; ${report.errors.size} error${if (report.errors.size == 1) "" else "s"} remain."
+                            !fixable -> "The errors are in files Vibecraft manages, so they cannot be fixed automatically."
+                            else -> "The build failed."
+                        }
+                        pubStage = 4; repairInfo = null; break
+                    }
+                    if (aiCalls - startCalls >= REPAIR_BUDGET) {
+                        pubInfo = "Auto-fix stopped: the AI request budget for this task is used up."
+                        pubStage = 4; repairInfo = null; break
+                    }
+                    round++
+                    repairInfo = "Fixing build errors (round $round of $repairMax)…"
+                    if (!repairOnce(projectId, report.errors, round)) {
+                        pubInfo = "Auto-fix could not produce a safe change."
+                        pubStage = 4; repairInfo = null; break
+                    }
+                    repairInfo = "Publishing the fix (round $round)…"
+                    pubStage = 1
+                    sha = try {
+                        pushNow(projectId, token, repo, branch, "Fix build errors (round $round)")
+                    } catch (e: GhError) {
+                        if (e.message?.startsWith("Nothing new") == true) {
+                            pubInfo = "The fix produced no new changes."
+                            pubStage = 4; repairInfo = null
+                            break
+                        } else throw e
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -644,6 +803,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 val m = e.message ?: "Publishing failed."
                 pubInfo = m
                 pubStage = if (m.startsWith("Nothing new")) 0 else 4
+                repairInfo = null
             }
         }
     }

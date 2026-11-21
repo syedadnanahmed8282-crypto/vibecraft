@@ -66,8 +66,10 @@ object AiClient {
         "When the user reports a problem or something that does not work (the preview, the look, a missing feature, an error), " +
         "find the cause in the project files and FIX it with FILE lines in the same reply, saying the cause and the fix in SUMMARY; " +
         "do not only explain and do not give general advice. If you need a file you cannot see, reply with READ lines first. " +
+        "The project manifest below lists every file with its purpose, the files it uses, its size and its version. Only some files are " +
+        "shown in full; files marked INCOMPLETE are shown in part. Never rewrite an INCOMPLETE file as a whole. " +
         "If the user asks to read, explain, review or find something in the code, do NOT write files: answer directly when the file " +
-        "contents are shown below, otherwise reply with only lines 'READ: <path>' (at most 3). " +
+        "contents are shown below, otherwise reply with only lines 'READ: <path>' or 'READ: <path>:<first line>-<last line>' (at most 3). " +
         "If the user only asks a question or chats, answer in a few sentences and write no FILE lines."
 
     /** Step 2: one request per file. */
@@ -75,7 +77,8 @@ object AiClient {
         "You write exactly one file now. Reply with ONLY one fenced code block and no other text. " +
         "For a new file send the complete file. For an existing file you may instead send edit blocks inside the code block, " +
         "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
-        "Send only the edits that are needed; to remove code send an edit with an empty replacement. " +
+        "Send only the edits that are needed; each SEARCH part must match exactly one place in the file; to remove code send an edit with an empty replacement. " +
+        "If the file is marked INCOMPLETE you must send edit blocks only. " +
         "preview.html must be one compact self-contained HTML file (under 150 lines, short CSS) with inline CSS and JS and no external resources. It is shown on a " +
         "260 by 500 pixel screen: fill that whole screen and do not draw a phone frame or a fake status bar. " +
         "ic_launcher_foreground.xml must be an Android vector drawable: <vector> with android:width and android:height of 108dp, " +
@@ -194,14 +197,17 @@ object AiClient {
             }
             res to res.bodyAsText()
         } catch (e: Exception) {
+            val secrets = headers.values.map { it.removePrefix("Bearer ").trim() }.filter { it.length >= 8 }
+            fun hide(t: String) = secrets.fold(t) { acc, k -> acc.replace(k, "***") }
             val slow = e::class.simpleName?.contains("Timeout", true) == true ||
                 e.message?.contains("timeout", true) == true || e.message?.contains("timed out", true) == true
             if (slow) throw TimedOut("The model took too long to answer.")
             if (e is kotlinx.coroutines.CancellationException) throw e
-            throw AiError("Network problem: ${e.message ?: "could not reach the provider"}")
+            throw AiError(hide("Network problem: ${e.message ?: "could not reach the provider"}"))
         }
         if (!r.status.isSuccess()) {
-            val msg = (errorMessage(text) ?: r.status.description).take(160)
+            val secrets = headers.values.map { it.removePrefix("Bearer ").trim() }.filter { it.length >= 8 }
+            val msg = secrets.fold((errorMessage(text) ?: r.status.description).take(160)) { acc, k -> acc.replace(k, "***") }
             val low = (msg + text.take(400)).lowercase()
             val limited = r.status.value in listOf(402, 408, 429, 500, 502, 503, 504, 529) ||
                 "quota" in low || "rate limit" in low || "overloaded" in low || "insufficient" in low

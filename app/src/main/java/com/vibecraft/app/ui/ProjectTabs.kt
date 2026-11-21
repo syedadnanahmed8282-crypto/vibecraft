@@ -28,6 +28,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.vibecraft.app.AppVm
 import com.vibecraft.app.data.FileEntity
+import com.vibecraft.app.gen.BuildStatus
 import com.vibecraft.app.gen.Template
 import kotlinx.coroutines.flow.flowOf
 
@@ -234,6 +235,8 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
             if (stage == 0) vm.pubInfo?.let {
                 Text(it, color = c.mu, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
             }
+            Text("Auto-fix build errors (rounds)", color = c.mu, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 14.dp, bottom = 6.dp))
+            SlidingTabs(listOf("Off", "1", "2", "3"), vm.repairMax, { vm.setRepairMax(it) })
         }
         Spacer(Modifier.height(14.dp))
         VcCard {
@@ -241,9 +244,13 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
             StepRow(1, "Uploading code", st(0))
             StepRow(2, "Building with Gradle", st(1))
             StepRow(3, "APK ready", st(2))
+            vm.repairInfo?.let {
+                Text(it, color = c.ac, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 6.dp))
+            }
             if (stage == 3) {
                 Text(
-                    "Open the build on GitHub, download $slug-apk at the bottom, unzip it and install $slug.apk.",
+                    "The build succeeded. This only means the code compiled, not that the app works correctly: test it on your phone.\n" +
+                        "Open the build on GitHub, download $slug-apk at the bottom, unzip it and install $slug.apk.",
                     color = c.mu, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp, bottom = 8.dp),
                 )
                 VcButton(
@@ -252,7 +259,15 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                 )
             }
             if (stage == 4) {
-                Text(vm.pubInfo ?: "Something went wrong.", color = Color(0xFFE0564A), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+                val status = vm.buildReport?.status
+                val title = when (status) {
+                    BuildStatus.FAILED -> "Build failed"
+                    BuildStatus.EXTRACTION_FAILED -> "Build failed, but its log could not be read"
+                    BuildStatus.INCONCLUSIVE -> "Build result unclear"
+                    else -> "Publishing stopped"
+                }
+                Text(title, color = Color(0xFFE0564A), fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+                Text(vm.pubInfo ?: "Something went wrong.", color = c.mu, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
                 vm.buildErrors?.let {
                     Text(
                         it, color = c.tx, fontSize = 11.sp, fontFamily = FontFamily.Monospace, lineHeight = 15.sp,
