@@ -29,6 +29,7 @@ object Lint {
             when {
                 path.endsWith(".kt") -> kotlin(path, text, out)
                 path.endsWith(".xml") -> xml(path, text, out)
+                path == "design.json" -> Design.parse(text).issues.forEach { out.add(Issue(path, it)) }
             }
         }
         files.keys.firstOrNull { it.endsWith("/AppRoot.kt") }?.let { root ->

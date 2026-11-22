@@ -33,7 +33,7 @@ import com.vibecraft.app.gen.Template
 import kotlinx.coroutines.flow.flowOf
 
 @Composable
-private fun Empty(title: String, text: String) {
+internal fun Empty(title: String, text: String) {
     val c = VCT.c
     Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Text(title, color = c.tx, fontWeight = FontWeight.Bold, fontSize = 15.sp)
@@ -42,56 +42,9 @@ private fun Empty(title: String, text: String) {
 }
 
 @Composable
-private fun filesOf(vm: AppVm, id: String?): List<FileEntity> {
+internal fun filesOf(vm: AppVm, id: String?): List<FileEntity> {
     val list by remember(id) { if (id != null) vm.files(id) else flowOf(emptyList<FileEntity>()) }.collectAsState(initial = emptyList())
     return list
-}
-
-/** The AI draws for a 260 x 500 screen. Fixing the page to that size avoids WebView laying it out against a zero-height viewport. */
-private fun prepared(html: String): String {
-    val inject = "<meta name=\"viewport\" content=\"width=260,initial-scale=1\">" +
-        "<style>html,body{width:260px!important;height:500px!important;margin:0!important;overflow:hidden!important}</style>"
-    val i = html.indexOf("</head>", ignoreCase = true)
-    return if (i >= 0) html.substring(0, i) + inject + html.substring(i) else inject + html
-}
-
-@Composable
-fun PreviewTab(vm: AppVm, projectId: String?) {
-    val html = filesOf(vm, projectId).firstOrNull { it.path == "preview.html" }?.content
-    TabPage {
-        if (html == null) {
-            Empty("No preview yet", "Describe an app in the chat. The AI adds a design preview here.")
-        } else {
-            val shape = RoundedCornerShape(30.dp)
-            // The frame is 14dp wider and taller than the page, so the 7dp border does not cover any of it.
-            Box(
-                Modifier.align(Alignment.CenterHorizontally).width(274.dp).height(514.dp)
-                    .clip(shape).border(7.dp, Color(0xFF10261B), shape).background(Color.White),
-            ) {
-                AndroidView(
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.blockNetworkLoads = true
-                            settings.allowFileAccess = false
-                            settings.allowContentAccess = false
-                            isVerticalScrollBarEnabled = false
-                            isHorizontalScrollBarEnabled = false
-                        }
-                    },
-                    update = {
-                        if (it.tag != html.hashCode()) {
-                            it.tag = html.hashCode()
-                            it.loadDataWithBaseURL(null, prepared(html), "text/html", "utf-8", null)
-                        }
-                    },
-                    modifier = Modifier.padding(7.dp).fillMaxSize().clip(RoundedCornerShape(23.dp)),
-                )
-            }
-            Note("Design preview only. The real app is built from the Kotlin files when you publish.")
-        }
-    }
 }
 
 @Composable

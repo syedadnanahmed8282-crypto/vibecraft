@@ -21,7 +21,10 @@ object Manifest {
 
     fun type(path: String) = when {
         path.endsWith(".kt") -> "kotlin"
+        path == "design.json" -> "design-tokens"
         path.endsWith(".html") -> "html-preview"
+        path.startsWith("preview/") && path.endsWith(".css") -> "preview-style"
+        path.startsWith("preview/") && path.endsWith(".js") -> "preview-script"
         path.endsWith(".xml") -> "android-xml"
         else -> "other"
     }
@@ -32,6 +35,9 @@ object Manifest {
     private fun purpose(path: String, text: String) = when (type(path)) {
         "kotlin" -> declared(text).take(5).let { if (it.isEmpty()) "Kotlin file" else "declares " + it.joinToString(", ") }
         "html-preview" -> "design sketch shown in the Preview tab"
+        "design-tokens" -> "design tokens (colors, text, spacing, corners) shared by the app and the preview"
+        "preview-style" -> "preview stylesheet"
+        "preview-script" -> "preview script"
         "android-xml" -> path.substringAfterLast('/')
         else -> "file"
     }

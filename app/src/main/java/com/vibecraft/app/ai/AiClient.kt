@@ -59,7 +59,12 @@ object AiClient {
         "and one line 'DELETE: <path>' for every file that is no longer needed. " +
         "List only files that must be created or changed, at most 8, each short (under 200 lines). " +
         "Order them so files used by other files come first, then AppRoot.kt. " +
-        "Add preview.html last when the look of the app changes or the project has no preview. " +
+        "Add the preview last when the look of the app changes or the project has no preview: preview.html, or for a bigger app " +
+        "preview/index.html with preview/screens/<name>.html, preview/styles/<name>.css and preview/scripts/<name>.js. " +
+        "A new app also needs design.json (the design tokens) listed first. For new apps and redesigns, Kotlin code must take every " +
+        "color, text size, spacing and corner from the generated object DesignTokens (DesignTokens.Light.primary and DesignTokens.Dark.primary " +
+        "with the same color names as design.json, plus titleSize, bodySize, captionSize, titleWeight, spaceXs, spaceS, spaceM, spaceL, " +
+        "radiusS, radiusM, radiusL, elevationCard, elevationSheet), and Theme.kt must build its color schemes from it. Never write DesignTokens.kt yourself. " +
         "Add APP_NAME later only if the user asks to rename the app. " +
         "A new app always needs its own icon: include app/src/main/res/drawable/ic_launcher_foreground.xml and " +
         "app/src/main/res/values/ic_launcher_colors.xml, and change them when the user asks for a new icon or logo. " +
@@ -83,8 +88,18 @@ object AiClient {
         "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
         "Send only the edits that are needed; each SEARCH part must match exactly one place in the file; to remove code send an edit with an empty replacement. " +
         "If the file is marked INCOMPLETE you must send edit blocks only. " +
-        "preview.html must be one compact self-contained HTML file (under 150 lines, short CSS) with inline CSS and JS and no external resources. It is shown on a " +
-        "260 by 500 pixel screen: fill that whole screen and do not draw a phone frame or a fake status bar. " +
+        "design.json holds the design tokens as JSON: {\"name\":\"App\",\"colors\":{\"light\":{...},\"dark\":{...}}," +
+        "\"typography\":{\"title\":22,\"body\":15,\"caption\":12,\"titleWeight\":700},\"spacing\":{\"xs\":4,\"s\":8,\"m\":16,\"l\":24}," +
+        "\"radius\":{\"s\":8,\"m\":16,\"l\":24},\"elevation\":{\"card\":2,\"sheet\":8}} where each color object has primary, onPrimary, " +
+        "background, surface, onSurface, muted, accent and error as #RRGGBB, with a dark palette that suits the light one. " +
+        "Preview files are preview.html (one compact page, under 150 lines) or, for a bigger app, preview/index.html with small files " +
+        "preview/screens/<name>.html, preview/styles/<name>.css and preview/scripts/<name>.js linked by relative paths such as screens/detail.html. " +
+        "Start every HTML file with <!-- vc-preview v2 -->. They are shown on a simulated phone of any size, so do not draw a phone frame, " +
+        "status bar or navigation bar and fill the whole screen. Keep content clear of the system bars with padding-top: var(--safe-top) and " +
+        "padding-bottom: var(--safe-bottom). Use only these CSS variables for colors, text, spacing and corners: --color-primary, --color-on-primary, " +
+        "--color-background, --color-surface, --color-on-surface, --color-muted, --color-accent, --color-error, --font-title, --font-body, --font-caption, " +
+        "--font-title-weight, --space-xs, --space-s, --space-m, --space-l, --radius-s, --radius-m, --radius-l, --elev-card, --elev-sheet. " +
+        "No external resources. " +
         "ic_launcher_foreground.xml must be an Android vector drawable: <vector> with android:width and android:height of 108dp, " +
         "android:viewportWidth and android:viewportHeight of 108, containing only <path> and <group> elements with android:fillColor " +
         "as a hex color and android:pathData; keep all artwork inside the central square from 21 to 87; use simple bold shapes that " +

@@ -26,6 +26,7 @@ import com.vibecraft.app.gen.BuildReport
 import com.vibecraft.app.gen.BuildStatus
 import com.vibecraft.app.gen.CodeBlocks
 import com.vibecraft.app.gen.ContextSelector
+import com.vibecraft.app.gen.PreviewSite
 import com.vibecraft.app.gen.EditResult
 import com.vibecraft.app.gen.Manifest
 import com.vibecraft.app.gen.Protect
@@ -375,8 +376,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         projectId: String, pf: PlanFile, plan: Plan, request: String,
         existing: Map<String, String>, written: Map<String, String>,
     ): String? {
-        val isPreview = pf.path == "preview.html"
-        val cur = if (isPreview) null else (written[pf.path] ?: existing[pf.path])
+        val isPreviewFile = pf.path == "preview.html" || pf.path.startsWith("preview/")
+        val oldFormat = pf.path == "preview.html" && existing["preview.html"]?.contains(PreviewSite.MARKER) != true
+        val cur = if (oldFormat) null else (written[pf.path] ?: existing[pf.path])
         val tooBig = cur != null && cur.length > FULL_FILE_LIMIT
         val others = (existing.keys + written.keys).filter { it != pf.path }
         val ctx = buildString {
@@ -387,11 +389,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             }
             if (others.isNotEmpty()) append("\nOther files in the project: ").append(others.joinToString(", ")).append('\n')
             append("\nWrite this file now: ").append(pf.path).append(" (").append(pf.desc).append(").")
-            if (isPreview) {
+            if (isPreviewFile && cur == null) {
                 val ui = existing.filter { (p, c) -> p.endsWith(".kt") && p !in written && c.contains("@Composable") }.entries.take(3)
                 ui.forEach { (p, c) -> append("\nExisting screen ").append(p).append(":\n```\n").append(c.take(3000)).append("\n```\n") }
-                append("\nWrite a fresh, compact preview (under 150 lines) of the app's main screen as it looks after this change, ")
-                append("with its features visible. It replaces the old preview.")
+                (written["design.json"] ?: existing["design.json"])?.let { append("\nDesign tokens (design.json):\n```\n").append(it.take(2500)).append("\n```\n") }
+                append("\nWrite a compact preview of the app as it looks after this change, with its features visible, following the preview rules. ")
+                append("It replaces an older preview if there is one.")
             } else if (cur != null && tooBig) {
                 val (head, n) = visibleHead(cur)
                 append("\n\nIts current content is INCOMPLETE (lines 1-$n of ${cur.lines().size}; the rest is not shown). Send edit blocks only, for the visible part:\n```\n")
@@ -522,9 +525,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 listOf(Template.ICON_FG to "app icon artwork", Template.ICON_COLORS to "icon background color")
                     .filter { (p, _) -> plan.files.none { it.path == p } }.map { PlanFile(it.first, it.second) }
             } else emptyList()
+            val designPlan = plan.files.firstOrNull { it.path == "design.json" }
+                ?: if (isNewApp) PlanFile("design.json", "design tokens: colors, text sizes, spacing, corners") else null
             val previewPlan = plan.files.firstOrNull { it.path == "preview.html" }
-            var files = plan.files.filter { it.path != "preview.html" } + icons
-            if (previewPlan != null || (current["preview.html"] == null && files.any { it.path.endsWith(".kt") })) {
+            var files = listOfNotNull(designPlan) + plan.files.filter { it.path != "preview.html" && it.path != "design.json" } + icons
+            val hasPreview = current.containsKey("preview.html") || current.containsKey("preview/index.html") || files.any { it.path.startsWith("preview/") }
+            if (previewPlan != null || (!hasPreview && files.any { it.path.endsWith(".kt") })) {
                 files = files + (previewPlan ?: PlanFile("preview.html", "design preview of the main screen"))
             }
             plan = plan.copy(files = files)
@@ -688,6 +694,18 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     fun lastPublished(id: String) = prefs.getInt("gh_pub_ver_$id", 0)
 
+    // ---- preview simulation settings ----
+    var previewDevice by mutableStateOf(prefs.getInt("pv_dev", 1)); private set
+    var previewDark by mutableStateOf(prefs.getBoolean("pv_dark", false)); private set
+    var previewButtons by mutableStateOf(prefs.getBoolean("pv_btn", false)); private set
+
+    fun setPreview(device: Int? = null, dark: Boolean? = null, buttons: Boolean? = null) {
+        device?.let { previewDevice = it }
+        dark?.let { previewDark = it }
+        buttons?.let { previewButtons = it }
+        prefs.edit().putInt("pv_dev", previewDevice).putBoolean("pv_dark", previewDark).putBoolean("pv_btn", previewButtons).apply()
+    }
+
     var buildReport by mutableStateOf<BuildReport?>(null); private set
     var repairInfo by mutableStateOf<String?>(null); private set
     var repairMax by mutableStateOf(prefs.getInt("repair_max", 2)); private set
@@ -706,7 +724,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         val gone = rows.filter { it.deletedAt != null && it.path !in own }.map { it.path }.toSet()
         val sha = GitHub.push(
             token, repo.trim(), branch.trim(), message.ifBlank { "Update from Vibecraft" },
-            Template.files(proj.name, projectId) + own, gone, listOf("${CodeBlocks.GEN}/", "app/src/main/res/"),
+            Template.files(proj.name, projectId, own["design.json"]) + own, gone, listOf("${CodeBlocks.GEN}/", "app/src/main/res/"),
         )
         if (GitHub.lastPruned.isNotEmpty()) {
             addMsg(projectId, "note", "Removed leftover files from the repository: " + GitHub.lastPruned.take(5).joinToString { it.substringAfterLast('/') })

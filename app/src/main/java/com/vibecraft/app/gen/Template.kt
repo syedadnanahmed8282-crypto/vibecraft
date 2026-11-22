@@ -9,7 +9,7 @@ object Template {
     fun slug(appName: String): String =
         appName.trim().replace(Regex("[^A-Za-z0-9]+"), "-").trim('-').ifBlank { "app" }.take(30)
 
-    fun files(appName: String, projectId: String): Map<String, String> {
+    fun files(appName: String, projectId: String, designJson: String? = null): Map<String, String> {
         val label = appName.replace("&", "&amp;").replace("<", "&lt;").replace("'", "\\'").replace("\"", "\\\"")
         val appId = "com.vibecraft.p" + projectId.filter { it.isLetterOrDigit() }.take(8).lowercase()
         return linkedMapOf(
@@ -23,6 +23,7 @@ object Template {
             "app/src/main/res/values/themes.xml" to THEMES,
             "app/src/main/java/com/vibecraft/generated/MainActivity.kt" to MAIN,
             "app/src/main/java/com/vibecraft/generated/AppRoot.kt" to APPROOT,
+            "${CodeBlocks.GEN}/DesignTokens.kt" to Design.toKotlin(Design.parse(designJson)),
             "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" to ICON_XML,
             ICON_FG to ICON_FOREGROUND,
             ICON_COLORS to ICON_COLOR_FILE,
