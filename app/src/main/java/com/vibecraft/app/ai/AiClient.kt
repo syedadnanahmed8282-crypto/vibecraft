@@ -84,6 +84,7 @@ object AiClient {
     /** Step 2: one request per file. */
     const val SYS_FILE = RULES +
         "You write exactly one file now. Reply with ONLY one fenced code block and no other text. " +
+        "Keep every Kotlin file under 300 lines: put separate parts of a screen into separate files. " +
         "For a new file send the complete file. For an existing file you may instead send edit blocks inside the code block, " +
         "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
         "Send only the edits that are needed; each SEARCH part must match exactly one place in the file; to remove code send an edit with an empty replacement. " +
@@ -109,6 +110,12 @@ object AiClient {
         "as a hex color and android:pathData; keep all artwork inside the central square from 21 to 87; use simple bold shapes that " +
         "suit the app, at most three colors, no gradients and no text. ic_launcher_colors.xml must be exactly: " +
         "<resources><color name=\"ic_launcher_background\">#RRGGBB</color></resources> with a color that suits the icon."
+
+    /** A file is too long to rewrite: only the grouping is chosen here, the app moves the code. */
+    const val SYS_SPLIT = "You split a long Kotlin file into smaller files. You only decide the grouping; the app moves the code. " +
+        "Reply with ONLY lines of the form 'GROUP: <NewFileName>.kt | Name1, Name2' (at most 6 groups, each declaration in at most one group). " +
+        "Group declarations by purpose, for example the display, the keypad, the history panel or helpers. " +
+        "Leave the entry function AppRoot and any shared theme or state declarations out, so they stay in the original file."
 
     /** Reading questions: answer from the files, never rewrite them. */
     const val SYS_ANSWER = RULES +

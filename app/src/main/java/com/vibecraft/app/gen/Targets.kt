@@ -16,6 +16,10 @@ object Targets {
 
     fun isTarget(s: String) = re.containsMatchIn(s)
 
+    /** Start and end (exclusive) of a top-level Kotlin declaration, or null when it is missing, not unique, or has an expression body. */
+    fun findKotlin(s: String, kind: String, name: String): Pair<Int, Int>? =
+        locateKotlin(s, kind, name).let { if (it.error == null) it.start to it.end else null }
+
     fun apply(original: String, path: String, text: String): EditResult {
         val lang = when {
             path.endsWith(".kt") -> "kt"

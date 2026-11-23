@@ -36,6 +36,7 @@ import com.vibecraft.app.gen.History
 import com.vibecraft.app.gen.Manifest
 import com.vibecraft.app.gen.Protect
 import com.vibecraft.app.gen.Reader
+import com.vibecraft.app.gen.Splitter
 import com.vibecraft.app.gen.Edits
 import com.vibecraft.app.gen.Lint
 import com.vibecraft.app.gen.Plan
@@ -357,7 +358,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 return null
             }
         } else if (mustEdit && cur != null) {
-            addMsg(projectId, "note", "Rejected a whole-file rewrite of $name because only part of the file was shown. Ask for a smaller change.")
+            addMsg(projectId, "note", "$name is too long to rewrite in one go and could not be split automatically. Ask for a smaller change, or ask to split it into smaller files.")
             return null
         }
         return CodeBlocks.normalize(path, body).second
@@ -412,6 +413,38 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             "\n\nFix only these problems. Current content of $path" + (if (big) " (INCOMPLETE, edit blocks only)" else "") +
             ":\n```\n$shown\n```\nSend edit blocks (preferred) or the complete file."
         return produce(projectId, path, content, ctx, mustEdit = big)
+    }
+
+    /**
+     * A Kotlin file longer than the limit cannot be rewritten safely. The AI picks a grouping and the app moves the
+     * declarations into new files (no code is retyped); the shorter original is then written as usual.
+     */
+    private suspend fun splitIfBig(projectId: String, path: String, current: MutableMap<String, String>, written: MutableMap<String, String>) {
+        val text = written[path] ?: current[path] ?: return
+        if (text.length <= FULL_FILE_LIMIT) return
+        val name = path.substringAfterLast('/')
+        val outline = Splitter.outline(text)
+        if (outline.size < 2) {
+            addMsg(projectId, "note", "$name is very long and could not be split automatically.")
+            return
+        }
+        val list = outline.joinToString("\n") { "${it.name} | ${it.kind} | lines ${it.firstLine}-${it.lastLine}" }
+        val r = askModel(projectId, AiClient.SYS_SPLIT, listOf("user" to "File: $name (${text.lines().size} lines)\nDeclarations:\n$list")) ?: return
+        val taken = (current.keys + written.keys).map { it.substringAfterLast('/') }.toSet()
+        val groups = Splitter.parseGroups(r.text, outline.map { it.name }.toSet(), taken, name)
+        if (groups.isEmpty()) {
+            addMsg(projectId, "note", "$name is very long and the AI gave no usable way to split it.")
+            return
+        }
+        val res = Splitter.split(text, path, groups)
+        if (res.error != null) {
+            addMsg(projectId, "note", "Could not split $name: ${res.error}")
+            return
+        }
+        current[path] = res.original
+        written[path] = res.original
+        res.created.forEach { (p, c) -> current[p] = c; written[p] = c }
+        addMsg(projectId, "note", "Split $name: moved ${res.moved.joinToString()} into ${res.created.keys.joinToString { it.substringAfterLast('/') }}.")
     }
 
     /** Saves the files as one version, adds a card per changed file to the chat, and returns the version. */
@@ -474,7 +507,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val request = all.lastOrNull { it.role == "user" }?.content ?: ""
             val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(6).map { it.role to it.content }
             val recentUser = all.filter { it.role == "user" }.takeLast(3).map { it.content }
-            val current = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }
+            val current = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }.toMutableMap()
             val baseHash = current.mapValues { Manifest.hash(it.value) }
             val sys = AiClient.SYS_PLAN + "\n\n" + contextOf(current, request, recentUser)
             val planReply = askModel(projectId, sys, history) ?: return
@@ -550,6 +583,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             var failedAt: String? = null
             for ((i, pf) in files.withIndex()) {
                 setStep(i + 1, 1)
+                if (pf.path.endsWith(".kt")) splitIfBig(projectId, pf.path, current, written)
                 val out = writeFile(projectId, pf, plan, request, current, written)
                 if (out == null) {
                     setStep(i + 1, 3)
