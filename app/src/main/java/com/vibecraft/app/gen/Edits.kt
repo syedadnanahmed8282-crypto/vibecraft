@@ -16,6 +16,10 @@ object Edits {
         if (expectedHash != null && Manifest.hash(original) != expectedHash) {
             return EditResult(null, "The file changed after the AI looked at it.")
         }
+        return applyBlocks(original, text)
+    }
+
+    fun applyBlocks(original: String, text: String): EditResult {
         var out = original
         var n = 0
         for (m in re.findAll(text)) {

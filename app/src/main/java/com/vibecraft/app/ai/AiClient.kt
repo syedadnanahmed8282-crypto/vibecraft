@@ -88,6 +88,10 @@ object AiClient {
         "each in this form:\n<<<<<<< SEARCH\n(exact existing lines)\n=======\n(replacement lines)\n>>>>>>> REPLACE\n" +
         "Send only the edits that are needed; each SEARCH part must match exactly one place in the file; to remove code send an edit with an empty replacement. " +
         "If the file is marked INCOMPLETE you must send edit blocks only. " +
+        "For a long file you may instead replace one whole definition by name with a target block: a line '<<<<<<< REPLACE fun Name' " +
+        "(or class, object, interface for Kotlin; css <selector> for CSS; id <elementId> for HTML; function <name> for JavaScript), " +
+        "then the complete new definition, then a line '>>>>>>> END'. The name must match exactly one place, and a function with an " +
+        "expression body (fun x() = ...) needs a SEARCH block instead. " +
         "design.json holds the design tokens as JSON: {\"name\":\"App\",\"colors\":{\"light\":{...},\"dark\":{...}}," +
         "\"typography\":{\"title\":22,\"body\":15,\"caption\":12,\"titleWeight\":700},\"spacing\":{\"xs\":4,\"s\":8,\"m\":16,\"l\":24}," +
         "\"radius\":{\"s\":8,\"m\":16,\"l\":24},\"elevation\":{\"card\":2,\"sheet\":8}} where each color object has primary, onPrimary, " +

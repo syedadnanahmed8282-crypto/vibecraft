@@ -8,7 +8,10 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.vibecraft.app.ai.AiClient
+import com.vibecraft.app.ai.Candidate
 import com.vibecraft.app.ai.Fallback
+import com.vibecraft.app.ai.ProviderOrder
+import com.vibecraft.app.ai.Selection
 import com.vibecraft.app.ai.Reply
 import com.vibecraft.app.ai.TimedOut
 import com.vibecraft.app.ai.Profile
@@ -27,7 +30,9 @@ import com.vibecraft.app.gen.BuildStatus
 import com.vibecraft.app.gen.CodeBlocks
 import com.vibecraft.app.gen.ContextSelector
 import com.vibecraft.app.gen.PreviewSite
+import com.vibecraft.app.gen.EditEngine
 import com.vibecraft.app.gen.EditResult
+import com.vibecraft.app.gen.History
 import com.vibecraft.app.gen.Manifest
 import com.vibecraft.app.gen.Protect
 import com.vibecraft.app.gen.Reader
@@ -264,23 +269,17 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     /** Asks the active model and moves to the next profile when one is out of quota. Null means it could not answer. */
     private suspend fun askModel(projectId: String, system: String, msgs: List<Pair<String, String>>, quiet: Boolean = false): Reply? {
         suspend fun say(t: String) { if (!quiet) addMsg(projectId, "note", t) }
-        val usable = profiles.filter { store.key(it.id) != null }
-        val ready = usable.filter { it.dailyLimit <= 0 || store.used(it.id) < it.dailyLimit }
-        val active = usable.firstOrNull { it.id == activeId }
-        if (usable.isEmpty()) {
-            say("Add an AI profile with an API key in Settings to get replies.")
-            return null
+        val sel = ProviderOrder.choose(
+            profiles.map { Candidate(it.id, it.name, store.key(it.id) != null, it.dailyLimit, store.used(it.id)) },
+            activeId, autoSwitch,
+        )
+        val order: List<Profile> = when (sel) {
+            is Selection.Blocked -> { say(sel.message); return null }
+            is Selection.Order -> {
+                sel.notice?.let { say(it) }
+                sel.ids.mapNotNull { id -> profiles.firstOrNull { it.id == id } }
+            }
         }
-        if (ready.isEmpty()) {
-            say("Every AI profile has reached its daily request limit. Raise the limit in Settings or try tomorrow.")
-            return null
-        }
-        if (active != null && active !in ready) {
-            if (!autoSwitch) { say("${active.name} reached its daily limit (${active.dailyLimit}). Auto-switch is off."); return null }
-            say("${active.name} reached its daily limit. Switched to ${ready.first().name} automatically.")
-        }
-        val first = ready.firstOrNull { it.id == activeId }
-        val order = listOfNotNull(first) + ready.filter { it !== first }
         var i = 0
         var retried = false
         while (i < order.size) {
@@ -344,8 +343,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             addMsg(projectId, "note", "The reply for $name was cut off or had no code. Try again, or use a model with a longer limit.")
             return null
         }
-        if (Edits.isEdit(body)) {
-            val res = if (cur != null) Edits.apply(cur, body, base) else EditResult(null, "The file does not exist yet, so edits cannot be applied.")
+        if (EditEngine.isEdit(body)) {
+            val res = if (cur != null) EditEngine.apply(cur, path, body, base) else EditResult(null, "The file does not exist yet, so edits cannot be applied.")
             if (res.text != null) return CodeBlocks.normalize(path, res.text).second
             if (mustEdit) {
                 addMsg(projectId, "note", "Could not apply the change to $name (${res.error}). The file is long, so it was not rewritten.")
@@ -353,7 +352,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             }
             val r2 = askModel(projectId, AiClient.SYS_FILE, listOf("user" to (ctx + "\n\nYour edit could not be applied (${res.error}). Send the complete new file in one code block instead."))) ?: return null
             body = codeOf(r2)
-            if (body == null || Edits.isEdit(body)) {
+            if (body == null || EditEngine.isEdit(body)) {
                 addMsg(projectId, "note", "Could not apply the change to $name.")
                 return null
             }
@@ -641,12 +640,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         }
         gone.forEach { path -> existing[path]?.let { dao.putFile(it.copy(deletedAt = now, updatedAt = now, dirty = true)) } }
         val v = (dao.maxVersion(projectId) ?: 0) + 1
-        val changes = buildJsonObject {
-            changed.forEach { (path, content) -> put(path, content) }
-            gone.forEach { put("__del:$it", "1") }
-        }
+        val changes = History.changes(changed.toMap(), gone)
         dao.putCheckpoint(
-            CheckpointEntity(CodeBlocks.checkpointId(projectId, v), projectId, v, title.take(60), model, changes.toString(), now)
+            CheckpointEntity(CodeBlocks.checkpointId(projectId, v), projectId, v, title.take(60), model, changes, now)
         )
         return (changed.size + gone.size) to v
     }
@@ -654,18 +650,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     /** Puts the project back to how it was at [version]; the restore itself becomes a new version. */
     fun restore(projectId: String, version: Int) {
         viewModelScope.launch {
-            val state = linkedMapOf<String, String>()
-            dao.checkpointsOnce(projectId).filter { it.version <= version }.forEach { cp ->
-                val o = Json.parseToJsonElement(cp.changes).jsonObject
-                if (o.containsKey("__full")) state.clear()
-                o.forEach { (k, v) ->
-                    when {
-                        k == "__full" -> {}
-                        k.startsWith("__del:") -> state.remove(k.removePrefix("__del:"))
-                        else -> state[k] = v.jsonPrimitive.content
-                    }
-                }
-            }
+            val state = History.replay(dao.checkpointsOnce(projectId).map { it.version to it.changes }, version)
             val now = System.currentTimeMillis()
             dao.filesOnce(projectId).forEach { f ->
                 if (f.deletedAt == null && f.path !in state) dao.putFile(f.copy(deletedAt = now, updatedAt = now, dirty = true))
@@ -674,9 +659,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 dao.putFile(FileEntity(CodeBlocks.fileId(projectId, path), projectId, path, content, now))
             }
             val v = (dao.maxVersion(projectId) ?: 0) + 1
-            val full = buildJsonObject { put("__full", "1"); state.forEach { (k, c) -> put(k, c) } }
+            val full = History.changes(state, full = true)
             dao.putCheckpoint(
-                CheckpointEntity(CodeBlocks.checkpointId(projectId, v), projectId, v, "Restored v$version", null, full.toString(), now)
+                CheckpointEntity(CodeBlocks.checkpointId(projectId, v), projectId, v, "Restored v$version", null, full, now)
             )
             backgroundSync()
         }

@@ -42,14 +42,45 @@ object Manifest {
         else -> "file"
     }
 
-    /** files: path -> content. Dependencies are the other project files whose declarations this file uses. */
+    val WEB_TYPES = setOf("html-preview", "preview-style", "preview-script")
+
+    private val refRe = Regex("""(?:href|src)\s*=\s*["']([^"'#?]+)["']|url\(\s*["']?([^"')#?]+)["']?\s*\)|@import\s+["']([^"']+)["']""")
+
+    /** Turns a relative reference found in [from] into a project path, or null (external, missing, or outside the project). */
+    fun resolve(from: String, ref: String, files: Set<String>): String? {
+        if (ref.startsWith("http") || ref.startsWith("data:") || ref.startsWith("//")) return null
+        val dir = if (ref.startsWith("/")) "" else from.substringBeforeLast('/', "")
+        val parts = ((if (dir.isEmpty()) "" else "$dir/") + ref.removePrefix("/")).split('/')
+        val out = mutableListOf<String>()
+        for (p in parts) {
+            when (p) {
+                "", "." -> {}
+                ".." -> if (out.isNotEmpty()) out.removeAt(out.lastIndex)
+                else -> out.add(p)
+            }
+        }
+        return out.joinToString("/").takeIf { it in files }
+    }
+
+    /** Files a preview page, stylesheet or script links to (pages, styles, scripts, assets). */
+    fun webDeps(path: String, text: String, files: Set<String>): List<String> =
+        refRe.findAll(text).mapNotNull { m ->
+            val ref = m.groupValues[1].ifEmpty { m.groupValues[2].ifEmpty { m.groupValues[3] } }
+            if (ref.isEmpty()) null else resolve(path, ref, files)
+        }.filter { it != path }.distinct().sorted().take(8).toList()
+
+    /** files: path -> content. Dependencies are the other project files this file uses or links to. */
     fun build(files: Map<String, String>): List<FileInfo> {
         val owner = HashMap<String, String>()
         files.filterKeys { it.endsWith(".kt") }.toSortedMap().forEach { (p, t) -> declared(t).forEach { owner.putIfAbsent(it, p) } }
+        val names = files.keys
         return files.map { (path, text) ->
-            val deps = if (path.endsWith(".kt")) {
-                wordRe.findAll(text).map { it.value }.toHashSet().mapNotNull { owner[it] }.filter { it != path }.distinct().sorted().take(8)
-            } else emptyList()
+            val deps = when {
+                path.endsWith(".kt") ->
+                    wordRe.findAll(text).map { it.value }.toHashSet().mapNotNull { owner[it] }.filter { it != path }.distinct().sorted().take(8)
+                type(path) in WEB_TYPES -> webDeps(path, text, names)
+                else -> emptyList()
+            }
             FileInfo(path, type(path), purpose(path, text), deps, text.count { it == '\n' } + 1, text.length, hash(text))
         }.sortedBy { it.path }
     }
@@ -82,30 +113,56 @@ data class ContextPack(val manifest: String, val shown: List<Shown>, val notShow
 
 object ContextSelector {
     const val DEFAULT_BUDGET = 14_000
+    const val WEB_BUDGET = 8_000
 
-    /** Picks the Kotlin files that matter for this request, within a character budget. */
+    private val previewWords = listOf(
+        "preview", "প্রিভিউ", "screen", "স্ক্রিন", "design", "ডিজাইন", "css", "style", "layout", "html",
+        "dark", "light", "theme", "থিম", "color", "colour", "রং", "রঙ", "font", "spacing",
+    )
+
+    /** Picks the Kotlin files that matter for this request, and the preview files when the request is about the look. */
     fun select(request: String, recent: List<String>, files: Map<String, String>, budget: Int = DEFAULT_BUDGET): ContextPack {
         val infos = Manifest.build(files)
         val manifest = Manifest.render(infos)
         val kt = files.filterKeys { it.endsWith(".kt") }
         val order: List<String> = if (kt.values.sumOf { it.length } <= budget) kt.keys.sorted() else rank(request, recent, kt, infos)
+        val shown = (fill(order, files, budget) + fill(webOrder(request, recent, files, infos), files, WEB_BUDGET)).toMutableList()
+        val shownPaths = shown.map { it.path }.toSet()
+        return ContextPack(manifest, shown, files.keys.filter { it !in shownPaths }.sorted())
+    }
 
-        val shown = mutableListOf<Shown>()
+    private fun fill(order: List<String>, src: Map<String, String>, budget: Int): List<Shown> {
+        val out = mutableListOf<Shown>()
         var left = budget
         for (p in order) {
-            val t = kt.getValue(p)
+            val t = src[p] ?: continue
             val lines = t.lines()
             if (t.length <= left) {
-                shown.add(Shown(p, t, true, 1, lines.size, lines.size)); left -= t.length
+                out.add(Shown(p, t, true, 1, lines.size, lines.size)); left -= t.length
             } else if (left > 600) {
                 var used = 0
                 var n = 0
                 for (l in lines) { if (used + l.length + 1 > left) break; used += l.length + 1; n++ }
-                shown.add(Shown(p, lines.take(n).joinToString("\n"), false, 1, n, lines.size)); left = 0
+                out.add(Shown(p, lines.take(n).joinToString("\n"), false, 1, n, lines.size)); left = 0
             } else break
         }
-        val shownPaths = shown.map { it.path }.toSet()
-        return ContextPack(manifest, shown, files.keys.filter { it !in shownPaths }.sorted())
+        return out
+    }
+
+    /** The preview entry, the files the request names, the design tokens, and what those files link to. */
+    private fun webOrder(request: String, recent: List<String>, files: Map<String, String>, infos: List<FileInfo>): List<String> {
+        val web = files.keys.filter { Manifest.type(it) in Manifest.WEB_TYPES || it == "design.json" }
+        if (web.isEmpty()) return emptyList()
+        val text = (request + " " + recent.joinToString(" ")).lowercase()
+        val named = web.filter { p ->
+            val base = p.substringAfterLast('/').substringBeforeLast('.').lowercase()
+            base.length >= 3 && base in text
+        }
+        if (previewWords.none { it in text } && named.isEmpty()) return emptyList()
+        val entry = listOfNotNull(listOf("preview/index.html", "preview.html").firstOrNull { it in files })
+        val top = (entry + named + web.filter { it == "design.json" }).distinct()
+        val deps = infos.filter { it.path in top }.flatMap { it.deps }.filter { it !in top && it in web }.distinct()
+        return top + deps
     }
 
     private fun rank(request: String, recent: List<String>, kt: Map<String, String>, infos: List<FileInfo>): List<String> {
