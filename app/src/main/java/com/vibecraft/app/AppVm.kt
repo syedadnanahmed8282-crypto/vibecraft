@@ -23,6 +23,8 @@ import com.vibecraft.app.data.MessageEntity
 import com.vibecraft.app.data.ProjectEntity
 import com.vibecraft.app.data.SyncRepo
 import com.vibecraft.app.ui.ThemeMode
+import com.vibecraft.app.gen.Brain
+import com.vibecraft.app.gen.BrainOps
 import com.vibecraft.app.gen.BuildError
 import com.vibecraft.app.gen.BuildLog
 import com.vibecraft.app.gen.BuildReport
@@ -33,10 +35,15 @@ import com.vibecraft.app.gen.PreviewSite
 import com.vibecraft.app.gen.EditEngine
 import com.vibecraft.app.gen.EditResult
 import com.vibecraft.app.gen.History
+import com.vibecraft.app.gen.Intent
+import com.vibecraft.app.gen.Intents
 import com.vibecraft.app.gen.Manifest
 import com.vibecraft.app.gen.Protect
 import com.vibecraft.app.gen.Reader
+import com.vibecraft.app.gen.RunReport
 import com.vibecraft.app.gen.Splitter
+import com.vibecraft.app.gen.Task
+import com.vibecraft.app.gen.TaskState
 import com.vibecraft.app.gen.Edits
 import com.vibecraft.app.gen.Lint
 import com.vibecraft.app.gen.Plan
@@ -50,7 +57,9 @@ import io.github.jan.supabase.auth.providers.builtin.Email
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -249,6 +258,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun addMsg(projectId: String, role: String, text: String) {
+        if (role == "note" && !text.startsWith("FILE|")) lastNote = text
         val now = System.currentTimeMillis()
         dao.putMessage(MessageEntity(UUID.randomUUID().toString(), projectId, role, text, now))
         dao.project(projectId)?.let { dao.putProject(it.copy(updatedAt = now, dirty = true)) }
@@ -258,6 +268,20 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     // ---- AI work: plan, read, write one file at a time, check, save, summarize ----
     var steps by mutableStateOf<List<Step>>(emptyList()); private set
     private var aiCalls = 0
+    private var lastNote: String? = null
+
+    var planFirst by mutableStateOf(prefs.getBoolean("plan_first", true)); private set
+    fun changePlanFirst(on: Boolean) { planFirst = on; prefs.edit().putBoolean("plan_first", on).apply() }
+
+    /** What the app remembers about a project: memory, brief, roadmap, tasks, last run. Stored in the project itself. */
+    fun brainFlow(id: String): Flow<Brain> = dao.files(id).map { rows -> BrainOps.parse(rows.firstOrNull { it.path == BrainOps.PATH }?.content) }
+
+    private suspend fun loadBrain(projectId: String): Brain =
+        BrainOps.parse(dao.filesOnce(projectId).firstOrNull { it.path == BrainOps.PATH && it.deletedAt == null }?.content)
+
+    private suspend fun saveBrain(projectId: String, b: Brain) {
+        dao.putFile(FileEntity(CodeBlocks.fileId(projectId, BrainOps.PATH), projectId, BrainOps.PATH, BrainOps.toJson(b), System.currentTimeMillis()))
+    }
 
     private fun setStep(i: Int, state: Int) {
         steps = steps.mapIndexed { j, st -> if (j == i) Step(st.label, state) else st }
@@ -462,11 +486,11 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return saved.second
     }
 
-    /** Closing note: what was done, which problem there was, and a commit message for GitHub. */
+    /** Closing note: what was done, the commit message for GitHub, and the updated project memory (returned). */
     private suspend fun summarize(
         projectId: String, request: String, plan: Plan, changed: List<String>, deleted: List<String>,
-        fixRounds: Int, warnings: List<String>, version: Int,
-    ) {
+        fixRounds: Int, warnings: List<String>, version: Int, memory: String, recent: List<String>,
+    ): String? {
         val prompt = buildString {
             append("User request:\n").append(request).append("\n\nPlan: ").append(plan.summary)
             append("\nFiles changed: ").append(changed.joinToString(", ").ifBlank { "none" })
@@ -474,14 +498,40 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             append("\nCode problems found and fixed automatically before saving: ")
             append(if (fixRounds > 0) "yes, in $fixRounds round(s)" else "none")
             append("\nRemaining warnings: ").append(if (warnings.isEmpty()) "none" else warnings.take(3).joinToString("; "))
+            append("\n\nCurrent memory:\n").append(memory.ifBlank { "(empty)" })
+            append("\n\nRecent user messages:\n").append(recent.joinToString("\n") { "- " + it.take(200) })
         }
-        val r = askModel(projectId, AiClient.SYS_SUMMARY, listOf("user" to prompt), quiet = true) ?: return
-        val commitLine = Regex("(?im)^\\s*COMMIT:\\s*(.+)$").find(r.text)?.groupValues?.get(1)?.trim()?.trim('"', '`')?.take(72)
-        val summary = Regex("(?is)SUMMARY:\\s*(.+)$").find(r.text)?.groupValues?.get(1)?.trim()
+        val r = askModel(projectId, AiClient.SYS_SUMMARY, listOf("user" to prompt), quiet = true) ?: return null
+        val sec = BrainOps.sections(r.text)
+        val commitLine = sec["COMMIT"]?.lineSequence()?.firstOrNull()?.trim()?.trim('"', '`')?.take(72)
+        val summary = sec["SUMMARY"]
         if (!summary.isNullOrBlank()) addMsg(projectId, "assistant", summary)
         if (!commitLine.isNullOrBlank()) {
             dao.checkpointsOnce(projectId).firstOrNull { it.version == version }?.let { dao.putCheckpoint(it.copy(title = commitLine, dirty = true)) }
         }
+        return sec["MEMORY"]?.takeIf { it.isNotBlank() }?.take(1500)
+    }
+
+    /** A memory refresh after a few answers that changed no code. */
+    private suspend fun refreshMemory(projectId: String, brain: Brain, recent: List<Pair<String, String>>): Brain {
+        val prompt = "Current memory:\n" + brain.memory.ifBlank { "(empty)" } + "\n\nRecent conversation:\n" +
+            recent.joinToString("\n") { "${it.first}: ${it.second.take(300)}" }
+        val r = askModel(projectId, AiClient.SYS_MEMORY, listOf("user" to prompt), quiet = true) ?: return brain.copy(sinceMemory = 0)
+        val t = r.text.trim().removePrefix("MEMORY:").trim()
+        return brain.copy(memory = if (t.isBlank()) brain.memory else t.take(1500), sinceMemory = 0)
+    }
+
+    /** A new app starts with a short plan the user approves; later steps follow it. */
+    private suspend fun briefFlow(projectId: String, history: List<Pair<String, String>>, brain: Brain, bn: Boolean) {
+        val r = askModel(projectId, AiClient.SYS_BRIEF, history) ?: return
+        val text = r.text.trim()
+        val phases = Regex("(?im)^\\s*PHASE\\s*\\d+\\s*:\\s*.+$").findAll(text).map { it.value.trim() }.toList().take(6)
+        if (phases.isEmpty()) {
+            addMsg(projectId, "assistant", text.ifBlank { "(empty reply)" })
+            return
+        }
+        saveBrain(projectId, brain.copy(brief = text.take(2500), roadmap = phases.map { Task(it) }))
+        addMsg(projectId, "assistant", text + "\n\n" + if (bn) "ঠিক থাকলে \"দাও\" লিখুন, বদলাতে চাইলে বলুন।" else "Say \"ok\" to start, or tell me what to change.")
     }
 
     /** Words that suggest the user is reporting something broken rather than asking a question. */
@@ -499,52 +549,109 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return l.length <= 24 && listOf("দাও", "করো", "কর", "মুছো", "মুছে", "ঠিক আছে", "ওকে", "হ্যাঁ", "ok", "okay", "yes", "do it", "go ahead").any { it in l }
     }
 
+    /** Notes the app wrote between the user's previous message and the latest one: what really happened. */
+    private fun eventsBefore(all: List<MessageEntity>): List<String> {
+        val last = all.indexOfLast { it.role == "user" }
+        if (last <= 0) return emptyList()
+        val prev = all.subList(0, last).indexOfLast { it.role == "user" }
+        return all.subList(prev + 1, last).filter { it.role == "note" && !it.content.startsWith("FILE|") }.map { it.content.take(200) }.takeLast(8)
+    }
+
     private suspend fun reply(projectId: String) {
         thinkingId = projectId
+        lastNote = null
         steps = listOf(Step("Reading your request", 1))
         try {
             val all = dao.messagesOnce(projectId)
-            val request = all.lastOrNull { it.role == "user" }?.content ?: ""
-            val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(6).map { it.role to it.content }
+            val typed = all.lastOrNull { it.role == "user" }?.content ?: ""
+            var request = typed
+            var origRequest = typed
+            var brain = loadBrain(projectId)
+            val bn = Intents.isBengali(typed)
+
+            // 1. "What happened?" is answered from what the app really recorded: instant, exact, no AI call.
+            if (Intents.quickStatus(typed) && brain.last != null) {
+                addMsg(projectId, "assistant", BrainOps.statusText(brain, bn))
+                return
+            }
+            // 2. A bare "ok / continue / fix it" picks up the unfinished work instead of starting over.
+            val next = BrainOps.next(brain)
+            val resuming = next != null && Intents.quickResume(typed)
+            if (resuming && next != null) {
+                origRequest = brain.last?.request ?: typed
+                request = "Continue the unfinished task: ${next.title}" + (brain.last?.request?.let { ". Original request: $it" } ?: "")
+                if (next.roadmapIndex != null) brain = brain.copy(active = next.roadmapIndex)
+                addMsg(projectId, "assistant", if (bn) "চালিয়ে যাচ্ছি: ${next.title}" else "Continuing: ${next.title}")
+            }
+            val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(8).map { it.role to it.content }
+            val hist = if (request != typed && history.isNotEmpty()) history.dropLast(1) + ("user" to request) else history
             val recentUser = all.filter { it.role == "user" }.takeLast(3).map { it.content }
-            val current = dao.filesOnce(projectId).filter { it.deletedAt == null }.associate { it.path to it.content }.toMutableMap()
+            val current = dao.filesOnce(projectId).filter { it.deletedAt == null && !it.path.startsWith(".vibecraft/") }
+                .associate { it.path to it.content }.toMutableMap()
             val baseHash = current.mapValues { Manifest.hash(it.value) }
-            val sys = AiClient.SYS_PLAN + "\n\n" + contextOf(current, request, recentUser)
-            val planReply = askModel(projectId, sys, history) ?: return
+            val isNewApp = current.keys.none { it.endsWith(".kt") }
+
+            // 3. A new app starts with a short plan the user approves, so later steps stay consistent with it.
+            if (planFirst && isNewApp && brain.brief.isBlank() && next == null && request.length >= 15 && !Intents.skipPlan(request)) {
+                briefFlow(projectId, history, brain, bn)
+                return
+            }
+
+            val events = eventsBefore(all)
+            val sys = AiClient.SYS_PLAN + "\n\n" + BrainOps.render(brain) + "\n\n" +
+                (if (events.isEmpty()) "" else "App events since your last answer (what really happened):\n" + events.joinToString("\n") { "- $it" } + "\n\n") +
+                contextOf(current, request, recentUser)
+            val planReply = askModel(projectId, sys, hist) ?: return
             var text = planReply.text
             var plan = PlanParser.parse(text)
+            var intent = Intents.parseLine(text)
 
             // The AI asked to look at files (or parts of long files) first: give it exactly that and let it plan again.
             if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isNotEmpty()) {
                 steps = listOf(Step("Reading ${plan.reads.size} file${if (plan.reads.size == 1) "" else "s"}", 1))
                 val chunks = plan.reads.mapNotNull { r -> current[r.path]?.let { Reader.chunk(r.path, it, r.from, r.to) } }.joinToString("\n\n")
-                val second = askModel(projectId, sys + "\n\nFiles you asked to read:\n" + chunks.ifBlank { "(none of those files exist)" }, history) ?: return
+                val second = askModel(projectId, sys + "\n\nFiles you asked to read:\n" + chunks.ifBlank { "(none of those files exist)" }, hist) ?: return
                 text = second.text
                 plan = PlanParser.parse(text)
+                intent = Intents.parseLine(text)
             }
-            // A problem report answered with advice only: ask once more for the fix itself.
-            if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isEmpty() &&
-                CodeBlocks.files(text).isEmpty() && (looksLikeProblem(request) || looksLikeConfirmation(request))
+            // "Check it" never changes files: if the AI planned changes anyway, ask for the check result instead.
+            val reviewOnly = Intents.looksLikeReview(typed) && !resuming
+            if (reviewOnly && (plan.files.isNotEmpty() || plan.deletes.isNotEmpty())) {
+                val again = askModel(
+                    projectId, sys,
+                    hist + ("assistant" to text) +
+                        ("user" to "The user only asked to check or review. Start with INTENT: ANSWER, tell in a few sentences what you found, and change nothing."),
+                )
+                text = again?.text ?: ""
+                plan = PlanParser.parse(text)
+                intent = Intent.ANSWER
+            }
+            // A problem report or a confirmation answered with advice only: ask once more for the work itself.
+            if (!reviewOnly && plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isEmpty() &&
+                CodeBlocks.files(text).isEmpty() && (looksLikeProblem(typed) || looksLikeConfirmation(typed))
             ) {
                 val again = askModel(
                     projectId, sys,
-                    history + ("assistant" to text) +
-                        ("user" to if (looksLikeProblem(request)) "This is a problem report. Find the cause in the project files and fix it now: reply in the FILE format, or with READ lines if you need a file."
-                        else "The user confirmed. Do now what you proposed, in the FILE / DELETE format. If nothing needs to change, say so in one sentence."),
+                    hist + ("assistant" to text) +
+                        ("user" to if (looksLikeProblem(typed)) "This is a problem report. Find the cause in the project files and fix it now: start with INTENT: ACT and reply in the FILE format, or with READ lines if you need a file."
+                        else "The user confirmed. Do now what you proposed: start with INTENT: ACT and reply in the FILE / DELETE format. If nothing needs to change, say so in one sentence."),
                 )
-                if (again != null) { text = again.text; plan = PlanParser.parse(text) }
+                if (again != null) { text = again.text; plan = PlanParser.parse(text); intent = Intents.parseLine(text) }
             }
 
-            if (plan.files.isEmpty() && plan.deletes.isEmpty()) {
-                // A plain answer, or a model that ignored the format and sent code blocks anyway.
-                val found = CodeBlocks.files(text).filter { Protect.canWrite(it.first) }
-                val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else text.ifBlank { "(empty reply)" }
+            if (intent == Intent.ANSWER || (plan.files.isEmpty() && plan.deletes.isEmpty())) {
+                // An answer, or a model that ignored the format and sent code blocks anyway.
+                val found = if (intent == Intent.ANSWER) emptyList() else CodeBlocks.files(text).filter { Protect.canWrite(it.first) }
+                val fallback = if (bn) "দেখেছি, কিছু বদলাইনি।" else "Checked; nothing was changed."
+                val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else Intents.stripControl(text).ifBlank { fallback }
                 addMsg(projectId, "assistant", shown)
                 if (found.isNotEmpty()) commit(projectId, found, emptyList(), request)
+                brain = brain.copy(sinceMemory = brain.sinceMemory + 1)
+                if (brain.sinceMemory >= 4) brain = refreshMemory(projectId, brain, history + ("assistant" to shown))
+                saveBrain(projectId, brain)
                 return
             }
-
-            val isNewApp = current.keys.none { it.endsWith(".kt") }
 
             // App name: the AI picks one for a new app (or when asked to rename).
             if (plan.appName.isNotBlank()) {
@@ -552,7 +659,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     dao.putProject(it.copy(name = plan.appName, updatedAt = System.currentTimeMillis(), dirty = true))
                 }
             }
-            // A new app always gets its own icon; preview.html always goes last.
+            // A new app always gets its own icon; the design tokens come first and the preview goes last.
             val icons = if (isNewApp) {
                 listOf(Template.ICON_FG to "app icon artwork", Template.ICON_COLORS to "icon background color")
                     .filter { (p, _) -> plan.files.none { it.path == p } }.map { PlanFile(it.first, it.second) }
@@ -579,29 +686,51 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val checkIdx = steps.size - 2
             val saveIdx = steps.size - 1
 
+            // The work is recorded as tasks, so a failure leaves something the user can simply continue.
+            brain = brain.copy(
+                tasks = files.map { Task(("Write ${it.path.substringAfterLast('/')}: ${it.desc}").trim().trimEnd(':', ' ')) } +
+                    wantedDeletes.map { Task("Delete ${it.substringAfterLast('/')}") },
+            )
+            saveBrain(projectId, brain)
+
             val written = linkedMapOf<String, String>()
+            val results = mutableListOf<String>()
             var failedAt: String? = null
             for ((i, pf) in files.withIndex()) {
                 setStep(i + 1, 1)
                 if (pf.path.endsWith(".kt")) splitIfBig(projectId, pf.path, current, written)
                 val out = writeFile(projectId, pf, plan, request, current, written)
+                val name = pf.path.substringAfterLast('/')
                 if (out == null) {
                     setStep(i + 1, 3)
+                    brain = brain.copy(tasks = brain.tasks.mapIndexed { j, t -> if (j == i) t.copy(state = TaskState.FAILED, note = lastNote ?: "") else t })
+                    results.add("$name: failed")
                     if (pf.path == "preview.html") continue   // only the sketch failed; the app files are still saved
-                    failedAt = pf.path.substringAfterLast('/')
+                    failedAt = name
                     break
                 }
                 written[pf.path] = out
+                brain = brain.copy(tasks = brain.tasks.mapIndexed { j, t -> if (j == i) t.copy(state = TaskState.DONE) else t })
+                results.add("$name: saved")
                 setStep(i + 1, 2)
             }
 
             // Deleting is destructive: keep a file when something that stays still uses it.
             val after = current + written
             val deletes = mutableListOf<String>()
-            for (d in wantedDeletes) {
+            for ((k, d) in wantedDeletes.withIndex()) {
                 val blockers = Protect.deleteBlockers(d, after).filter { it !in wantedDeletes }
-                if (blockers.isEmpty()) deletes.add(d)
-                else addMsg(projectId, "note", "Did not delete ${d.substringAfterLast('/')}: still used by ${blockers.take(3).joinToString { it.substringAfterLast('/') }}.")
+                val ti = files.size + k
+                if (blockers.isEmpty()) {
+                    deletes.add(d)
+                    brain = brain.copy(tasks = brain.tasks.mapIndexed { j, t -> if (j == ti) t.copy(state = TaskState.DONE) else t })
+                    results.add("${d.substringAfterLast('/')}: deleted")
+                } else {
+                    val why = "still used by ${blockers.take(3).joinToString { it.substringAfterLast('/') }}"
+                    addMsg(projectId, "note", "Did not delete ${d.substringAfterLast('/')}: $why.")
+                    brain = brain.copy(tasks = brain.tasks.mapIndexed { j, t -> if (j == ti) t.copy(state = TaskState.FAILED, note = why) else t })
+                    results.add("${d.substringAfterLast('/')}: kept ($why)")
+                }
             }
 
             // Check before saving: fix what the checker finds, at most two rounds.
@@ -633,18 +762,40 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 addMsg(projectId, "note", "Skipped ${stale.joinToString { it.substringAfterLast('/') }}: it changed while the AI was working.")
             }
 
+            var version: Int? = null
+            var newMemory: String? = null
             if (written.isNotEmpty() || deletes.isNotEmpty()) {
                 setStep(saveIdx, 1)
-                val version = commit(projectId, written.toList(), deletes, request)
+                version = commit(projectId, written.toList(), deletes, request)
                 setStep(saveIdx, 2)
                 if (warnings.isNotEmpty()) {
                     addMsg(projectId, "note", "Saved with warnings: " + warnings.take(3).joinToString("; "))
                 }
-                if (version != null) summarize(projectId, request, plan, written.keys.toList(), deletes, fixRounds, warnings, version)
+                if (version != null) {
+                    newMemory = summarize(projectId, request, plan, written.keys.toList(), deletes, fixRounds, warnings, version, brain.memory, recentUser)
+                }
             }
             if (failedAt != null) {
                 addMsg(projectId, "note", "Stopped at $failedAt." + if (written.isNotEmpty()) " The files before it were saved." else "")
             }
+
+            // What the app records here is what "what happened?" is answered from, and what "continue" resumes.
+            val problem = failedAt?.let { "stopped at $it: ${lastNote ?: "unknown reason"}" }
+                ?: if (results.any { it.endsWith("failed") }) lastNote else null
+            val left = brain.tasks.filter { it.state != TaskState.DONE }
+            var roadmap = brain.roadmap
+            var active = brain.active
+            if (left.isEmpty() && active >= 0 && active < roadmap.size && failedAt == null) {
+                roadmap = roadmap.mapIndexed { j, t -> if (j == active) t.copy(state = TaskState.DONE) else t }
+                active = -1
+            }
+            brain = brain.copy(
+                tasks = left, roadmap = roadmap, active = active,
+                memory = newMemory ?: brain.memory,
+                sinceMemory = if (newMemory != null) 0 else brain.sinceMemory + 1,
+                last = RunReport(origRequest.take(200), plan.summary.take(200), results, version, problem, System.currentTimeMillis()),
+            )
+            saveBrain(projectId, brain)
         } finally {
             thinkingId = null
             steps = emptyList()
@@ -687,7 +838,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val state = History.replay(dao.checkpointsOnce(projectId).map { it.version to it.changes }, version)
             val now = System.currentTimeMillis()
             dao.filesOnce(projectId).forEach { f ->
-                if (f.deletedAt == null && f.path !in state) dao.putFile(f.copy(deletedAt = now, updatedAt = now, dirty = true))
+                if (f.deletedAt == null && f.path !in state && !f.path.startsWith(".vibecraft/")) dao.putFile(f.copy(deletedAt = now, updatedAt = now, dirty = true))
             }
             state.forEach { (path, content) ->
                 dao.putFile(FileEntity(CodeBlocks.fileId(projectId, path), projectId, path, content, now))
@@ -739,7 +890,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     private suspend fun pushNow(projectId: String, token: String, repo: String, branch: String, message: String): String {
         val proj = dao.project(projectId) ?: error("Open a project first.")
         val rows = dao.filesOnce(projectId)
-        val own = rows.filter { it.deletedAt == null }.associate { it.path to it.content }
+        val own = rows.filter { it.deletedAt == null && !it.path.startsWith(".vibecraft/") }.associate { it.path to it.content }
         val gone = rows.filter { it.deletedAt != null && it.path !in own }.map { it.path }.toSet()
         val sha = GitHub.push(
             token, repo.trim(), branch.trim(), message.ifBlank { "Update from Vibecraft" },

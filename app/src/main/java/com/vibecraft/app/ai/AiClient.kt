@@ -38,6 +38,12 @@ data class Reply(val text: String, val cut: Boolean = false)
 object AiClient {
     private const val RULES = "You are Vibecraft, an assistant that designs and writes Android apps with Kotlin and Jetpack Compose. " +
         "Use Material 3 and a clean white and forest green look. Reply in the language the user writes. " +
+        "The user often writes English words in Bengali letters. Read them as: এপিকে = APK, কটলিন = Kotlin, প্রিভিউ = preview, " +
+        "বিল্ড = build, পাবলিশ = publish, কমিট = commit, গিটহাব = GitHub, ইরর = error, ফাইল = file, ডিজাইন = design, থিম = theme, " +
+        "প্ল্যান = plan. Never read them as other words. Always answer in the language the user wrote in. " +
+        "Use the project memory, the unfinished tasks and the app events below: stay consistent with earlier decisions, continue " +
+        "unfinished work, and say plainly what was done or could not be done. The app events tell what really happened; never claim " +
+        "anything they do not confirm. " +
         "Project rules: the code package is com.vibecraft.generated; the entry point is a composable function fun AppRoot() in " +
         "app/src/main/java/com/vibecraft/generated/AppRoot.kt; all Kotlin files live in app/src/main/java/com/vibecraft/generated/; " +
         "only these libraries exist: Compose BOM with ui, foundation, material3, material-icons-core, activity-compose, " +
@@ -52,7 +58,11 @@ object AiClient {
 
     /** Step 1: decide between a plain answer, a read, or a short plan of files. */
     const val SYS_PLAN = RULES +
-        "Decide what the user wants. If they want an app built or changed, reply in EXACTLY this format and nothing else: " +
+        "Start your reply with exactly one line: 'INTENT: ACT' when the user wants something built, changed, fixed, deleted or continued now, " +
+        "or 'INTENT: ANSWER' when they ask a question, ask you to check, review, explain or read something, ask what happened, or just chat " +
+        "(a check or review never changes files unless they also ask for a change; দেখো, চেক, যাচাই, কেন, কখন, কি হইছে are questions). " +
+        "With INTENT: ANSWER write the answer right after that line, in a few clear sentences, using the memory, the tasks, the events and the files, and no FILE lines. " +
+        "With INTENT: ACT, after that line reply in EXACTLY this format and nothing else: " +
         "a first line 'SUMMARY: ' with one or two friendly sentences saying what you are about to do (future tense, for example 'I will add...'); " +
         "for a new app a line 'APP_NAME: ' with a short, catchy, original name of one or two words (use the user's own name if they gave one); " +
         "then one line per file: 'FILE: <path> | <what it does in under 12 words>'; " +
@@ -122,11 +132,27 @@ object AiClient {
         "Answer the user's question about the project code below in a few short sentences, in the user's language. " +
         "Do not write or rewrite files and do not paste long code; quote only the few lines that matter."
 
-    /** Closing note after a change. */
-    const val SYS_SUMMARY = "You write the closing note of a coding task. Reply in exactly two lines. " +
-        "First line: 'COMMIT: ' then a git commit message in English, imperative mood, under 60 characters. " +
-        "Second line: 'SUMMARY: ' then two or three short friendly sentences in the language the user wrote, saying what you did, " +
-        "which problem there was (if any) and that it was fixed. No code and no markdown."
+    /** Closing note after a change, plus the updated project memory. */
+    const val SYS_SUMMARY = "You write the closing note of a coding task. Reply in exactly this form. " +
+        "COMMIT: a git commit message in English, imperative mood, under 60 characters. " +
+        "SUMMARY: two or three short friendly sentences in the language the user wrote, saying what you did, which problem there was (if any) " +
+        "and that it was fixed, or what is still open. No code and no markdown. " +
+        "MEMORY: the updated project memory, at most 1200 characters, as short lines that start with GOAL:, DECISIONS:, DESIGN:, USER: or OPEN:. " +
+        "The USER line records the user's language, how they like to work, and the words they use for things (for example এপিকে = APK). " +
+        "Keep earlier facts that are still true, add what was said or done in this task, remove what is outdated. Facts only, no guesses."
+
+    /** A memory refresh without any code change. */
+    const val SYS_MEMORY = "You keep the memory of a coding project for an assistant. You get the current memory and the recent conversation. " +
+        "Reply with ONLY the updated memory, at most 1200 characters, as short lines that start with GOAL:, DECISIONS:, DESIGN:, USER: or OPEN:. " +
+        "The USER line records the user's language, how they like to work, and the words they use for things. " +
+        "Keep earlier facts that are still true, add new facts the user stated or the assistant did, remove what is outdated. Facts only, no guesses."
+
+    /** The plan a user approves before a new app is built. */
+    const val SYS_BRIEF = "You plan a new Android app with Kotlin and Jetpack Compose together with the user, before any code is written. " +
+        "Reply in the language the user wrote, with these lines: GOAL: one sentence. SCREENS: the screens, separated by commas. " +
+        "FEATURES: the main features, separated by commas. DESIGN: the look in one sentence (style, colors, mood). " +
+        "Then 3 to 5 lines 'PHASE 1: ...', 'PHASE 2: ...' where each phase is one small buildable step and phase 1 already gives a working app. " +
+        "Add one line 'QUESTION: ...' only if something essential is missing. No code."
 
     const val SYSTEM = SYS_PLAN
 

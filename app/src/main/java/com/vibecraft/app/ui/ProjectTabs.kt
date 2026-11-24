@@ -28,7 +28,10 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.vibecraft.app.AppVm
 import com.vibecraft.app.data.FileEntity
+import com.vibecraft.app.gen.Brain
+import com.vibecraft.app.gen.BrainOps
 import com.vibecraft.app.gen.BuildStatus
+import com.vibecraft.app.gen.TaskState
 import com.vibecraft.app.gen.Template
 import kotlinx.coroutines.flow.flowOf
 
@@ -44,21 +47,24 @@ internal fun Empty(title: String, text: String) {
 @Composable
 internal fun filesOf(vm: AppVm, id: String?): List<FileEntity> {
     val list by remember(id) { if (id != null) vm.files(id) else flowOf(emptyList<FileEntity>()) }.collectAsState(initial = emptyList())
-    return list
+    return list.filter { !it.path.startsWith(".vibecraft/") }
 }
 
 @Composable
 fun CodeTab(vm: AppVm, projectId: String?) {
     val c = VCT.c
-    var history by remember { mutableStateOf(false) }
+    var tabIdx by remember { mutableStateOf(0) }
+    val history = tabIdx == 1
     var viewing by remember { mutableStateOf<FileEntity?>(null) }
     val files = filesOf(vm, projectId)
     val cps by remember(projectId) { if (projectId != null) vm.checkpoints(projectId) else flowOf(emptyList<com.vibecraft.app.data.CheckpointEntity>()) }
         .collectAsState(initial = emptyList())
     TabPage {
-        SlidingTabs(listOf("Files", "History"), if (history) 1 else 0, { history = it == 1 })
+        SlidingTabs(listOf("Files", "History", "Notes"), tabIdx, { tabIdx = it })
         Spacer(Modifier.height(14.dp))
-        if (!history) {
+        if (tabIdx == 2) {
+            NotesView(vm, projectId)
+        } else if (!history) {
             if (files.isEmpty()) Empty("No files yet", "Files the AI writes appear here.")
             else {
                 VcCard(pad = 4.dp) {
@@ -236,6 +242,45 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                     )
                 }
             }
+        }
+    }
+}
+
+/** Shows what the AI remembers about the project, so nothing is hidden. */
+@Composable
+private fun NotesView(vm: AppVm, projectId: String?) {
+    val c = VCT.c
+    val brain by remember(projectId) { if (projectId != null) vm.brainFlow(projectId) else flowOf(Brain()) }.collectAsState(initial = Brain())
+    VcCard {
+        CardTitle(Ic.Code, "What the AI remembers")
+        Text(brain.memory.ifBlank { "Nothing yet. It fills in as you work." }, color = c.tx, fontSize = 13.sp, lineHeight = 19.sp)
+    }
+    if (brain.brief.isNotBlank()) {
+        Spacer(Modifier.height(12.dp))
+        VcCard {
+            CardTitle(Ic.File, "Approved plan")
+            Text(brain.brief, color = c.tx, fontSize = 12.5.sp, lineHeight = 18.sp)
+        }
+    }
+    val steps = brain.roadmap + brain.tasks
+    if (steps.isNotEmpty()) {
+        Spacer(Modifier.height(12.dp))
+        VcCard {
+            CardTitle(Ic.Check, "Roadmap and tasks")
+            steps.forEach { t ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Chip(t.state.name.lowercase(), active = t.state == TaskState.DONE)
+                    Spacer(Modifier.width(10.dp))
+                    Text(t.title, color = c.tx, fontSize = 12.5.sp, modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+    if (brain.last != null) {
+        Spacer(Modifier.height(12.dp))
+        VcCard {
+            CardTitle(Ic.Up, "Last run")
+            Text(BrainOps.statusText(brain, false), color = c.tx, fontSize = 12.5.sp, lineHeight = 18.sp)
         }
     }
 }

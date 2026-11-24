@@ -1,5 +1,11 @@
 package com.vibecraft.app.ui
 
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -18,13 +24,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vibecraft.app.AppVm
-import com.vibecraft.app.ai.Profile
+import kotlinx.coroutines.delay
 
 @Composable
 internal fun Note(text: String) {
@@ -61,7 +68,7 @@ fun SettingsTab(vm: AppVm) {
     val c = VCT.c
     var confirm by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
-    var editing by remember { mutableStateOf<Profile?>(null) }
+    var editing by remember { mutableStateOf<com.vibecraft.app.ai.Profile?>(null) }
     TabPage {
         VcCard {
             CardTitle(Ic.Code, "AI profiles")
@@ -99,7 +106,7 @@ fun SettingsTab(vm: AppVm) {
                     Box(Modifier.size(28.dp).clip(RoundedCornerShape(8.dp)).clickable { vm.moveProfile(i, 1) }, Alignment.Center) { Icon(Ic.ChevDown, "Down", Modifier.size(15.dp), tint = c.tx) }
                 }
             }
-            VcButton("Add profile", { adding = true }, Modifier.padding(top = 12.dp).fillMaxWidth().testTag("add_profile_button"), secondary = true, icon = Ic.Plus)
+            VcButton("Add profile", { adding = true }, Modifier.padding(top = 12.dp).fillMaxWidth(), secondary = true, icon = Ic.Plus)
             Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Auto-switch when limit is reached", color = c.tx, fontSize = 13.5.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                 VcSwitch(vm.autoSwitch) { vm.toggleAuto(it) }
@@ -109,7 +116,11 @@ fun SettingsTab(vm: AppVm) {
         VcCard {
             CardTitle(Ic.Phone, "Preferences")
             Text("Theme", color = c.mu, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 8.dp, bottom = 6.dp))
-            SlidingTabs(listOf("System", "Light", "Dark"), vm.theme.ordinal, { vm.changeTheme(ThemeMode.entries[it]) })
+            SlidingTabs(listOf("System", "Light", "Dark"), vm.theme.ordinal, { vm.changeTheme(ThemeMode.values()[it]) })
+            Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Plan first for new apps", color = c.tx, fontSize = 13.5.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                VcSwitch(vm.planFirst) { vm.changePlanFirst(it) }
+            }
         }
         Spacer(Modifier.height(14.dp))
         VcCard {
@@ -119,13 +130,13 @@ fun SettingsTab(vm: AppVm) {
                 color = c.mu, fontSize = 12.5.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
             )
             if (vm.signedIn) {
-                VcButton(if (vm.busy) "Syncing…" else "Sync now", { vm.syncNow() }, Modifier.fillMaxWidth().testTag("sync_now_button"), enabled = !vm.busy)
+                VcButton(if (vm.busy) "Syncing…" else "Sync now", { vm.syncNow() }, Modifier.fillMaxWidth(), enabled = !vm.busy)
                 Spacer(Modifier.height(8.dp))
             }
-            VcButton(if (vm.signedIn) "Sign out (keep data on this phone)" else "Leave guest mode", { vm.signOut(false) }, Modifier.fillMaxWidth().testTag("sign_out_button"), secondary = true)
+            VcButton(if (vm.signedIn) "Sign out (keep data on this phone)" else "Leave guest mode", { vm.signOut(false) }, Modifier.fillMaxWidth(), secondary = true)
             Text(
                 "Sign out and clear this phone", color = Color(0xFFE0564A), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().clickable { confirm = true }.padding(top = 14.dp, bottom = 4.dp).testTag("clear_phone_button"),
+                modifier = Modifier.fillMaxWidth().clickable { confirm = true }.padding(top = 14.dp, bottom = 4.dp),
             )
             vm.message?.let { Text(it, color = c.mu, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp)) }
         }
