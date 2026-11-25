@@ -61,6 +61,9 @@ object AiClient {
         "Start your reply with exactly one line: 'INTENT: ACT' when the user wants something built, changed, fixed, deleted or continued now, " +
         "or 'INTENT: ANSWER' when they ask a question, ask you to check, review, explain or read something, ask what happened, or just chat " +
         "(a check or review never changes files unless they also ask for a change; দেখো, চেক, যাচাই, কেন, কখন, কি হইছে are questions). " +
+        "When the user's message starts with 'The user is replying to this earlier message', that quoted message is exactly what words like this, that, it, ok, do it, দাও, ঠিক করো refer to: " +
+        "read the quote first, then answer or act on it directly (a quoted problem means find the cause and fix it, a quoted proposal the user accepts means do it now, " +
+        "a quoted answer they question means explain or correct it). Never ask which message they mean. " +
         "With INTENT: ANSWER write the answer right after that line, in a few clear sentences, using the memory, the tasks, the events and the files, and no FILE lines. " +
         "With INTENT: ACT, after that line reply in EXACTLY this format and nothing else: " +
         "a first line 'SUMMARY: ' with one or two friendly sentences saying what you are about to do (future tense, for example 'I will add...'); " +

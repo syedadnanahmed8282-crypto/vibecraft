@@ -40,10 +40,8 @@ import kotlinx.coroutines.delay
 
 @Composable
 fun VcCard(modifier: Modifier = Modifier, pad: Dp = 16.dp, content: @Composable ColumnScope.() -> Unit) {
-    val c = VCT.c
-    val shape = RoundedCornerShape(12.dp)
     Column(
-        modifier.fillMaxWidth().clip(shape).background(c.sf).border(1.dp, c.bd, shape).padding(pad),
+        modifier.fillMaxWidth().glass(RoundedCornerShape(18.dp), strong = false, lift = 4.dp).padding(pad),
         content = content,
     )
 }
@@ -110,7 +108,7 @@ fun VcField(
             )
             if (password) {
                 Box(Modifier.align(Alignment.CenterEnd).size(40.dp).clickable { show = !show }, Alignment.Center) {
-                    Icon(Ic.Eye, "Toggle password visibility", Modifier.size(20.dp), tint = if (show) c.ac else c.mu)
+                    Icon(Ic.Eye, null, Modifier.size(20.dp), tint = if (show) c.ac else c.mu)
                 }
             }
         }

@@ -40,7 +40,7 @@ internal fun Note(text: String) {
 
 @Composable
 internal fun TabPage(content: @Composable ColumnScope.() -> Unit) {
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), content = content)
+    Column(Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 76.dp, bottom = 28.dp), content = content)
 }
 
 @Composable

@@ -56,6 +56,7 @@ class ProfileStore(ctx: Context) {
     fun putKey(id: String, k: String) { keys?.edit()?.putString("k_$id", k)?.apply() }
     fun removeKey(id: String) { keys?.edit()?.remove("k_$id")?.apply() }
     fun ghToken(): String? = runCatching { keys?.getString("gh_token", null) }.getOrNull()
+    fun clearGhToken() { keys?.edit()?.remove("gh_token")?.apply() }
     fun setGhToken(t: String): Boolean { val k = keys ?: return false; k.edit().putString("gh_token", t).apply(); return true }
     fun activeId(): String? = meta.getString("active", null)
     fun setActive(id: String?) { meta.edit().putString("active", id).apply() }

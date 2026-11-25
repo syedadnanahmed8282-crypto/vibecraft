@@ -36,6 +36,9 @@ import com.vibecraft.app.gen.EditEngine
 import com.vibecraft.app.gen.EditResult
 import com.vibecraft.app.gen.History
 import com.vibecraft.app.gen.Intent
+import com.vibecraft.app.gen.Notes
+import com.vibecraft.app.gen.Problem
+import com.vibecraft.app.gen.Quoting
 import com.vibecraft.app.gen.Intents
 import com.vibecraft.app.gen.Manifest
 import com.vibecraft.app.gen.Protect
@@ -77,7 +80,11 @@ private const val FULL_FILE_LIMIT = 24_000
 private const val REPAIR_BUDGET = 10
 
 /** One line in the live progress card. state: 0 waiting, 1 running, 2 done, 3 failed. */
-data class Step(val label: String, val state: Int)
+/** One progress row. phase: read, reason, plan, work, check or save. state: 0 waiting, 1 active, 2 done, 3 failed. */
+data class Step(
+    val label: String, val state: Int, val phase: String = "", val sub: String = "",
+    val progress: Float = -1f, val startedAt: Long = 0L,
+)
 
 class AppVm(app: Application) : AndroidViewModel(app) {
     private val vc = app as VibecraftApp
@@ -257,8 +264,14 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return id
     }
 
+    /** Runs the last user message again (the Try again button). */
+    fun retry(projectId: String) {
+        if (thinkingId != null) return
+        viewModelScope.launch { reply(projectId) }
+    }
+
     private suspend fun addMsg(projectId: String, role: String, text: String) {
-        if (role == "note" && !text.startsWith("FILE|")) lastNote = text
+        if (role == "note" && !text.startsWith("FILE|") && !text.startsWith("ERR|") && !text.startsWith("PAUSE|")) lastNote = text
         val now = System.currentTimeMillis()
         dao.putMessage(MessageEntity(UUID.randomUUID().toString(), projectId, role, text, now))
         dao.project(projectId)?.let { dao.putProject(it.copy(updatedAt = now, dirty = true)) }
@@ -269,6 +282,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     var steps by mutableStateOf<List<Step>>(emptyList()); private set
     private var aiCalls = 0
     private var lastNote: String? = null
+    private var lastErr: Problem? = null
+    private var deferErr = false
+    private var fileDescs: Map<String, String> = emptyMap()
 
     var planFirst by mutableStateOf(prefs.getBoolean("plan_first", true)); private set
     fun changePlanFirst(on: Boolean) { planFirst = on; prefs.edit().putBoolean("plan_first", on).apply() }
@@ -283,8 +299,30 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         dao.putFile(FileEntity(CodeBlocks.fileId(projectId, BrainOps.PATH), projectId, BrainOps.PATH, BrainOps.toJson(b), System.currentTimeMillis()))
     }
 
-    private fun setStep(i: Int, state: Int) {
-        steps = steps.mapIndexed { j, st -> if (j == i) Step(st.label, state) else st }
+    // ---- progress phases: Reading, Reasoning, Planning, Working, Checking, Saving ----
+    private val phaseKeys = listOf("read", "reason", "plan", "work", "check", "save")
+    private val phaseNames = listOf("Reading", "Reasoning", "Planning", "Working", "Checking", "Saving")
+    private var phState = IntArray(6)
+    private var phSub = Array(6) { "" }
+    private var phStart = LongArray(6)
+    private var phProgress = -1f
+
+    private fun pushPhases() {
+        steps = List(6) { i -> Step(phaseNames[i], phState[i], phaseKeys[i], phSub[i], if (i == 3) phProgress else -1f, phStart[i]) }
+    }
+
+    private fun resetPhases() {
+        phState = IntArray(6); phSub = Array(6) { "" }; phStart = LongArray(6); phProgress = -1f
+        pushPhases()
+    }
+
+    /** state: 0 waiting, 1 active, 2 done, 3 failed. The timer starts when a phase first becomes active. */
+    private fun phase(i: Int, state: Int, sub: String? = null) {
+        val was = phState[i]
+        phState[i] = state
+        if (sub != null) phSub[i] = sub
+        if (state == 1 && was != 1) phStart[i] = System.currentTimeMillis()
+        pushPhases()
     }
 
     /** What the AI is told about the project: a manifest plus only the files that matter for this request. */
@@ -294,12 +332,18 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     /** Asks the active model and moves to the next profile when one is out of quota. Null means it could not answer. */
     private suspend fun askModel(projectId: String, system: String, msgs: List<Pair<String, String>>, quiet: Boolean = false): Reply? {
         suspend fun say(t: String) { if (!quiet) addMsg(projectId, "note", t) }
+        // A terminal error is kept for the closing card; while files are being written it is not shown twice.
+        suspend fun fail(kind: String, title: String, sub: String, raw: String) {
+            lastErr = Problem(kind, title, sub, raw)
+            lastNote = title
+            if (!quiet && !deferErr) addMsg(projectId, "note", Notes.err(kind, title, sub, raw))
+        }
         val sel = ProviderOrder.choose(
             profiles.map { Candidate(it.id, it.name, store.key(it.id) != null, it.dailyLimit, store.used(it.id)) },
             activeId, autoSwitch,
         )
         val order: List<Profile> = when (sel) {
-            is Selection.Blocked -> { say(sel.message); return null }
+            is Selection.Blocked -> { fail("setup", sel.message, "", ""); return null }
             is Selection.Order -> {
                 sel.notice?.let { say(it) }
                 sel.ids.mapNotNull { id -> profiles.firstOrNull { it.id == id } }
@@ -327,7 +371,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     say("${p.name} took too long. Switched to ${next.name} automatically.")
                     i++
                 } else {
-                    say("${p.name} did not answer in time. Try again, or pick a faster model.")
+                    fail("timeout", "${p.name} took too long", "No answer in time. Free models can be slow: try again or pick a faster one.", e.message ?: "timeout")
                     return null
                 }
             } catch (e: Fallback) {
@@ -337,11 +381,17 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     say("${p.name} limit reached. Switched to ${next.name} automatically.")
                     i++
                 } else {
-                    say("${p.name} limit reached." + if (!autoSwitch) " Auto-switch is off." else "")
+                    fail("limit", "${p.name} reached its daily limit", if (!autoSwitch) "Auto-switch is off. Turn it on or pick another model." else "No other model is ready.", e.message ?: "limit")
                     return null
                 }
             } catch (e: Exception) {
-                say("${p.name}: ${e.message ?: "request failed"}")
+                val m = e.message ?: "request failed"
+                val low = m.lowercase()
+                if ("401" in low || "403" in low || "unauthorized" in low || "api key" in low || "api_key" in low) {
+                    fail("key", "The API key for ${p.name} was rejected", "Check the key in AI profiles.", m)
+                } else {
+                    fail("other", "${p.name} could not answer", m.take(140), m)
+                }
                 return null
             }
         }
@@ -480,8 +530,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             addMsg(projectId, "note", "Nothing changed: the files are already up to date.")
             return null
         }
-        changed.forEach { (path, _) -> addMsg(projectId, "note", "FILE|${if (path in old) "updated" else "created"}|$path") }
-        deletes.forEach { addMsg(projectId, "note", "FILE|deleted|$it") }
+        changed.forEach { (path, _) -> addMsg(projectId, "note", Notes.file(if (path in old) "updated" else "created", path, fileDescs[path].orEmpty())) }
+        deletes.forEach { addMsg(projectId, "note", Notes.file("deleted", it, "")) }
         addMsg(projectId, "note", "Saved ${saved.first} file${if (saved.first == 1) "" else "s"} · v${saved.second}")
         return saved.second
     }
@@ -523,7 +573,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     /** A new app starts with a short plan the user approves; later steps follow it. */
     private suspend fun briefFlow(projectId: String, history: List<Pair<String, String>>, brain: Brain, bn: Boolean) {
+        phase(0, 2); phase(2, 1, "drafting the plan")
         val r = askModel(projectId, AiClient.SYS_BRIEF, history) ?: return
+        phase(2, 2)
         val text = r.text.trim()
         val phases = Regex("(?im)^\\s*PHASE\\s*\\d+\\s*:\\s*.+$").findAll(text).map { it.value.trim() }.toList().take(6)
         if (phases.isEmpty()) {
@@ -554,38 +606,41 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         val last = all.indexOfLast { it.role == "user" }
         if (last <= 0) return emptyList()
         val prev = all.subList(0, last).indexOfLast { it.role == "user" }
-        return all.subList(prev + 1, last).filter { it.role == "note" && !it.content.startsWith("FILE|") }.map { it.content.take(200) }.takeLast(8)
+        return all.subList(prev + 1, last).filter { it.role == "note" && !it.content.startsWith("FILE|") }.map { Notes.plain(it.content).take(200) }.takeLast(8)
     }
 
     private suspend fun reply(projectId: String) {
         thinkingId = projectId
         lastNote = null
-        steps = listOf(Step("Reading your request", 1))
+        resetPhases(); phase(0, 1, "your request and project files")
+        lastErr = null; deferErr = false; fileDescs = emptyMap()
         try {
             val all = dao.messagesOnce(projectId)
-            val typed = all.lastOrNull { it.role == "user" }?.content ?: ""
-            var request = typed
+            val rawTyped = all.lastOrNull { it.role == "user" }?.content ?: ""
+            val replied = Quoting.decode(rawTyped)           // the user swiped to reply to an earlier message
+            val typed = replied?.text ?: rawTyped
+            var request = if (replied != null) Quoting.forAi(replied) else typed
             var origRequest = typed
             var brain = loadBrain(projectId)
             val bn = Intents.isBengali(typed)
 
             // 1. "What happened?" is answered from what the app really recorded: instant, exact, no AI call.
-            if (Intents.quickStatus(typed) && brain.last != null) {
+            if (Intents.quickStatus(typed) && brain.last != null && replied == null) {
                 addMsg(projectId, "assistant", BrainOps.statusText(brain, bn))
                 return
             }
             // 2. A bare "ok / continue / fix it" picks up the unfinished work instead of starting over.
             val next = BrainOps.next(brain)
-            val resuming = next != null && Intents.quickResume(typed)
+            val resuming = next != null && replied == null && Intents.quickResume(typed)
             if (resuming && next != null) {
                 origRequest = brain.last?.request ?: typed
                 request = "Continue the unfinished task: ${next.title}" + (brain.last?.request?.let { ". Original request: $it" } ?: "")
                 if (next.roadmapIndex != null) brain = brain.copy(active = next.roadmapIndex)
                 addMsg(projectId, "assistant", if (bn) "চালিয়ে যাচ্ছি: ${next.title}" else "Continuing: ${next.title}")
             }
-            val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(8).map { it.role to it.content }
+            val history = all.filter { it.role == "user" || it.role == "assistant" }.takeLast(8).map { it.role to Quoting.forAiText(it.content) }
             val hist = if (request != typed && history.isNotEmpty()) history.dropLast(1) + ("user" to request) else history
-            val recentUser = all.filter { it.role == "user" }.takeLast(3).map { it.content }
+            val recentUser = all.filter { it.role == "user" }.takeLast(3).map { Quoting.decode(it.content)?.text ?: it.content }
             val current = dao.filesOnce(projectId).filter { it.deletedAt == null && !it.path.startsWith(".vibecraft/") }
                 .associate { it.path to it.content }.toMutableMap()
             val baseHash = current.mapValues { Manifest.hash(it.value) }
@@ -601,6 +656,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val sys = AiClient.SYS_PLAN + "\n\n" + BrainOps.render(brain) + "\n\n" +
                 (if (events.isEmpty()) "" else "App events since your last answer (what really happened):\n" + events.joinToString("\n") { "- $it" } + "\n\n") +
                 contextOf(current, request, recentUser)
+            phase(0, 2); phase(1, 1, "waiting for ${activeName ?: "the model"}")
             val planReply = askModel(projectId, sys, hist) ?: return
             var text = planReply.text
             var plan = PlanParser.parse(text)
@@ -608,8 +664,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
             // The AI asked to look at files (or parts of long files) first: give it exactly that and let it plan again.
             if (plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isNotEmpty()) {
-                steps = listOf(Step("Reading ${plan.reads.size} file${if (plan.reads.size == 1) "" else "s"}", 1))
+                phase(1, 2); phase(0, 1, "${plan.reads.size} file${if (plan.reads.size == 1) "" else "s"} you asked for")
                 val chunks = plan.reads.mapNotNull { r -> current[r.path]?.let { Reader.chunk(r.path, it, r.from, r.to) } }.joinToString("\n\n")
+                phase(0, 2); phase(1, 1, "waiting for ${activeName ?: "the model"}")
                 val second = askModel(projectId, sys + "\n\nFiles you asked to read:\n" + chunks.ifBlank { "(none of those files exist)" }, hist) ?: return
                 text = second.text
                 plan = PlanParser.parse(text)
@@ -646,7 +703,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 val fallback = if (bn) "দেখেছি, কিছু বদলাইনি।" else "Checked; nothing was changed."
                 val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else Intents.stripControl(text).ifBlank { fallback }
                 addMsg(projectId, "assistant", shown)
-                if (found.isNotEmpty()) commit(projectId, found, emptyList(), request)
+                if (found.isNotEmpty()) commit(projectId, found, emptyList(), origRequest)
                 brain = brain.copy(sinceMemory = brain.sinceMemory + 1)
                 if (brain.sinceMemory >= 4) brain = refreshMemory(projectId, brain, history + ("assistant" to shown))
                 saveBrain(projectId, brain)
@@ -678,13 +735,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 addMsg(projectId, "note", "${it.substringAfterLast('/')} is not in this project. If it only exists in your GitHub repository, it is removed automatically on the next publish.")
             }
 
-            addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change ${files.size + wantedDeletes.size} files." })
             val total = files.size + wantedDeletes.size
-            steps = listOf(Step("Planned $total change${if (total == 1) "" else "s"}", 2)) +
-                files.map { Step("Writing ${it.path.substringAfterLast('/')}", 0) } +
-                Step("Checking the code", 0) + Step("Saving version", 0)
-            val checkIdx = steps.size - 2
-            val saveIdx = steps.size - 1
+            phase(1, 2); phase(2, 1, "$total change${if (total == 1) "" else "s"} to make")
+            addMsg(projectId, "assistant", plan.summary.ifBlank { "I will change $total files." })
+            delay(450)
+            phase(2, 2)
+            fileDescs = files.associate { it.path to it.desc }
 
             // The work is recorded as tasks, so a failure leaves something the user can simply continue.
             brain = brain.copy(
@@ -696,13 +752,15 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val written = linkedMapOf<String, String>()
             val results = mutableListOf<String>()
             var failedAt: String? = null
+            deferErr = true
             for ((i, pf) in files.withIndex()) {
-                setStep(i + 1, 1)
+                phProgress = i.toFloat() / files.size
+                phase(3, 1, "${pf.path.substringAfterLast('/')} · ${i + 1} of ${files.size}")
                 if (pf.path.endsWith(".kt")) splitIfBig(projectId, pf.path, current, written)
                 val out = writeFile(projectId, pf, plan, request, current, written)
                 val name = pf.path.substringAfterLast('/')
                 if (out == null) {
-                    setStep(i + 1, 3)
+                    phase(3, 3, "stopped at $name")
                     brain = brain.copy(tasks = brain.tasks.mapIndexed { j, t -> if (j == i) t.copy(state = TaskState.FAILED, note = lastNote ?: "") else t })
                     results.add("$name: failed")
                     if (pf.path == "preview.html") continue   // only the sketch failed; the app files are still saved
@@ -712,8 +770,10 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 written[pf.path] = out
                 brain = brain.copy(tasks = brain.tasks.mapIndexed { j, t -> if (j == i) t.copy(state = TaskState.DONE) else t })
                 results.add("$name: saved")
-                setStep(i + 1, 2)
+                phProgress = (i + 1f) / files.size
+                pushPhases()
             }
+            if (failedAt == null) phase(3, 2)
 
             // Deleting is destructive: keep a file when something that stays still uses it.
             val after = current + written
@@ -737,7 +797,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             var fixRounds = 0
             var warnings = emptyList<String>()
             if (written.isNotEmpty()) {
-                setStep(checkIdx, 1)
+                phase(4, 1, "looking for code problems")
                 fun state() = current.filterKeys { it !in deletes } + written
                 var issues = Lint.check(state())
                 while (issues.isNotEmpty() && fixRounds < 2) {
@@ -751,7 +811,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     issues = Lint.check(state())
                 }
                 warnings = issues.map { "${it.path.substringAfterLast('/')}: ${it.text}" }
-                setStep(checkIdx, if (warnings.isEmpty()) 2 else 3)
+                phase(4, if (warnings.isEmpty()) 2 else 3, if (warnings.isEmpty()) null else "${warnings.size} warning${if (warnings.size == 1) "" else "s"}")
             }
 
             // Stale check: a file that changed while the AI worked on it must not be overwritten.
@@ -765,9 +825,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             var version: Int? = null
             var newMemory: String? = null
             if (written.isNotEmpty() || deletes.isNotEmpty()) {
-                setStep(saveIdx, 1)
-                version = commit(projectId, written.toList(), deletes, request)
-                setStep(saveIdx, 2)
+                phase(5, 1, "your changes")
+                version = commit(projectId, written.toList(), deletes, origRequest)
+                phase(5, 2)
                 if (warnings.isNotEmpty()) {
                     addMsg(projectId, "note", "Saved with warnings: " + warnings.take(3).joinToString("; "))
                 }
@@ -775,8 +835,14 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     newMemory = summarize(projectId, request, plan, written.keys.toList(), deletes, fixRounds, warnings, version, brain.memory, recentUser)
                 }
             }
+            val e = lastErr
             if (failedAt != null) {
-                addMsg(projectId, "note", "Stopped at $failedAt." + if (written.isNotEmpty()) " The files before it were saved." else "")
+                addMsg(
+                    projectId, "note",
+                    Notes.pause(e?.kind ?: "other", e?.title ?: "Writing stopped at $failedAt", e?.sub ?: "", e?.raw ?: "", written.size, files.size, failedAt),
+                )
+            } else if (e != null && results.any { it.endsWith("failed") }) {
+                addMsg(projectId, "note", Notes.err(e.kind, e.title, e.sub, e.raw))
             }
 
             // What the app records here is what "what happened?" is answered from, and what "continue" resumes.
@@ -799,6 +865,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         } finally {
             thinkingId = null
             steps = emptyList()
+            deferErr = false
+            fileDescs = emptyMap()
         }
     }
 
@@ -859,6 +927,19 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     var buildErrors by mutableStateOf<String?>(null); private set
 
     fun hasGhToken() = store.ghToken() != null
+
+    /** True when a GitHub token is saved (it is entered in Settings, not on the Publish page). */
+    var ghSaved by mutableStateOf(store.ghToken() != null); private set
+
+    /** Returns an error text, or null when the token was saved. */
+    fun saveGhToken(t: String): String? {
+        if (t.isBlank()) return "Paste the token first."
+        if (!store.setGhToken(t.trim())) return "Secure storage is not available on this phone, so the token cannot be saved."
+        ghSaved = true
+        return null
+    }
+
+    fun clearGhToken() { store.clearGhToken(); ghSaved = false }
     fun ghRepo(id: String) = prefs.getString("gh_repo_$id", "") ?: ""
     fun ghBranch(id: String) = prefs.getString("gh_branch_$id", "main") ?: "main"
 
@@ -946,7 +1027,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             if (issues.isNotEmpty()) return false
         }
         val saved = saveFiles(projectId, fixed.toList(), "Fix build errors (round $round)", activeName) ?: return false
-        fixed.keys.forEach { addMsg(projectId, "note", "FILE|updated|$it") }
+        fixed.keys.forEach { addMsg(projectId, "note", Notes.file("updated", it, "")) }
         addMsg(projectId, "note", "Auto-fixed build errors · v${saved.second}")
         return true
     }

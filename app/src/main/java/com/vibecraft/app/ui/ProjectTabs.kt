@@ -51,9 +51,9 @@ internal fun filesOf(vm: AppVm, id: String?): List<FileEntity> {
 }
 
 @Composable
-fun CodeTab(vm: AppVm, projectId: String?) {
+fun CodeTab(vm: AppVm, projectId: String?, initialTab: Int = 0) {
     val c = VCT.c
-    var tabIdx by remember { mutableStateOf(0) }
+    var tabIdx by remember(initialTab) { mutableStateOf(initialTab) }
     val history = tabIdx == 1
     var viewing by remember { mutableStateOf<FileEntity?>(null) }
     val files = filesOf(vm, projectId)
@@ -129,7 +129,7 @@ fun CodeTab(vm: AppVm, projectId: String?) {
 }
 
 @Composable
-fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
+fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit, onSettings: () -> Unit) {
     val c = VCT.c
     val ctx = LocalContext.current
     var repo by remember(projectId) { mutableStateOf(projectId?.let { vm.ghRepo(it) } ?: "") }
@@ -145,7 +145,6 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
     var msg by remember { mutableStateOf(suggestion) }
     var edited by remember { mutableStateOf(false) }
     LaunchedEffect(suggestion) { if (!edited) msg = suggestion }
-    var token by remember { mutableStateOf("") }
     val stage = vm.pubStage
     val running = stage == 1 || stage == 2
     fun st(i: Int) = when (stage) {
@@ -166,29 +165,20 @@ fun PublishTab(vm: AppVm, projectId: String?, onFix: () -> Unit) {
                 VcField(branch, { branch = it }, "Branch", "main", mono = true, modifier = Modifier.weight(1f))
             }
             VcField(msg, { msg = it; edited = true }, "Commit message")
-            VcField(
-                token, { token = it }, "GitHub token",
-                if (vm.hasGhToken()) "Saved. Leave blank to keep it" else "ghp_… or github_pat_…", password = true, mono = true,
+            Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("GitHub token", color = c.mu, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                Chip(if (vm.ghSaved) "Saved" else "Not set", active = vm.ghSaved)
+            }
+            Text(
+                if (vm.ghSaved) "Change or remove it in Settings (left menu)." else "Add your token in Settings (left menu) before publishing.",
+                color = c.mu, fontSize = 11.5.sp, modifier = Modifier.padding(top = 6.dp),
             )
             Text(
-                "No token yet? Tap Get token. GitHub opens with the right options already ticked (repo and workflow). " +
-                    "Scroll down, press Generate token, copy it and paste it above. It stays encrypted on this phone.",
-                color = c.mu, fontSize = 11.5.sp, modifier = Modifier.padding(top = 8.dp),
+                "Open Settings", color = c.ac, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.clickable(onClick = onSettings).padding(top = 8.dp, bottom = 2.dp),
             )
             VcButton(
-                "Get token on GitHub",
-                { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/settings/tokens/new?scopes=repo,workflow&description=Vibecraft"))) },
-                Modifier.padding(top = 10.dp).fillMaxWidth(), secondary = true, icon = Ic.Up,
-            )
-            Text(
-                "Prefer limited access? Create a fine-grained token (Contents and Workflows: read and write, Actions: read)",
-                color = c.ac, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-                    .clickable { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/settings/personal-access-tokens/new"))) }
-                    .padding(top = 12.dp),
-            )
-            VcButton(
-                "Commit & push", { vm.publish(projectId, repo, branch, msg, token); token = "" },
+                "Commit & push", { vm.publish(projectId, repo, branch, msg, "") },
                 Modifier.padding(top = 14.dp).fillMaxWidth(), enabled = !running, loading = running, icon = Ic.Up,
             )
             if (stage == 0) vm.pubInfo?.let {
