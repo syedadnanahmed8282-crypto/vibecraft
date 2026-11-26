@@ -18,8 +18,8 @@ android {
         applicationId = "com.aistudio.liquidglass.rqlvpk"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "0.13.0"
+        versionCode = 16
+        versionName = "0.15.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

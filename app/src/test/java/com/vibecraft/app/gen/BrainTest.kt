@@ -124,4 +124,80 @@ class BrainTest {
         assertTrue(Intents.skipPlan("build it directly"))
         assertFalse(Intents.skipPlan("একটা ক্যালকুলেটর বানাও"))
     }
+
+    // ---- plan questions, decisions and plan changes ----
+
+    @Test fun planStateAndPendingSurviveSaving() {
+        val b = Brain(planState = "draft", planRounds = 1, pending = Pending("make it", "Which colors?", 2))
+        assertEquals(b, BrainOps.parse(BrainOps.toJson(b)))
+    }
+
+    @Test fun brainFilesFromEarlierVersionsStillLoad() {
+        val b = BrainOps.parse("""{"memory":"m","brief":"b"}""")
+        assertEquals("", b.planState)
+        assertNull(b.pending)
+    }
+
+    @Test fun askIsAnIntent() {
+        assertEquals(Intent.ASK, Intents.parseLine("INTENT: ASK\nThe plan changes."))
+        assertEquals(Intent.ACT, Intents.parseLine("intent: act"))
+    }
+
+    @Test fun finalPlanStatusIsRead() {
+        assertEquals("READY", BrainOps.status("STATUS: READY\nGOAL: x"))
+        assertEquals("ASK", BrainOps.status("status: ask\n1. colors?"))
+        assertEquals("CANCEL", BrainOps.status("STATUS: CANCEL"))
+        assertNull(BrainOps.status("GOAL: x"))
+    }
+
+    @Test fun oneLineOfAPlanIsFound() {
+        val p = "GOAL: a calculator\nNAME: Sky Calc (or Pocket)\nICON: blue leaf"
+        assertEquals("Sky Calc (or Pocket)", BrainOps.field(p, "NAME"))
+        assertEquals("blue leaf", BrainOps.field(p, "icon"))
+        assertNull(BrainOps.field(p, "DESIGN"))
+    }
+
+    @Test fun phasesAreCollectedInOrder() {
+        val t = "GOAL: x\nPHASE 1: Basic calculator\n  PHASE 2: History\nQUESTIONS:\n1. colors?"
+        assertEquals(listOf("PHASE 1: Basic calculator", "PHASE 2: History"), BrainOps.parsePhases(t))
+    }
+
+    @Test fun planLinesDropGreetingsAndQuestions() {
+        val t = "Here is the plan:\nGOAL: a\nNAME: b\nQUESTIONS:\n1. colors?\nPHASE 1: x\nOK to start?"
+        assertEquals("GOAL: a\nNAME: b\nPHASE 1: x", BrainOps.planLines(t))
+    }
+
+    @Test fun anAppNameIsCleaned() {
+        assertEquals("Sky Calc", BrainOps.cleanName("Sky Calc (or Pocket Math)"))
+        assertEquals("Sky Calc", BrainOps.cleanName("\u201CSky Calc\u201D"))
+        assertEquals("A", BrainOps.cleanName("A / B"))
+        assertEquals(28, BrainOps.cleanName("x".repeat(60)).length)
+    }
+
+    @Test fun theFirstMemoryComesFromThePlan() {
+        val m = BrainOps.memoryFromPlan("GOAL: calculator\nNAME: Sky Calc\nICON: blue leaf\nDESIGN: soft 3D\nFEATURES: history\nNOTES: no ads", true)
+        assertTrue(m.contains("NAME: Sky Calc"))
+        assertTrue(m.contains("ICON: blue leaf"))
+        assertTrue(m.contains("DECISIONS: no ads"))
+        assertTrue(m.contains("USER: writes Bengali"))
+        assertTrue(BrainOps.memoryFromPlan("GOAL: x", false).contains("USER: writes English"))
+    }
+
+    @Test fun aChangedPlanKeepsThePhasesThatAreDone() {
+        val old = listOf(Task("PHASE 1: Basic calculator", TaskState.DONE), Task("PHASE 2: History"))
+        val merged = BrainOps.mergeRoadmap(old, listOf("PHASE 1: basic  calculator", "PHASE 2: Dark mode", "PHASE 3: History"))
+        assertEquals(listOf(TaskState.DONE, TaskState.TODO, TaskState.TODO), merged.map { it.state })
+    }
+
+    @Test fun theClosingNoteMayCarryAChangedPlan() {
+        val s = BrainOps.sections("COMMIT: x\nSUMMARY: y\nMEMORY: GOAL: a\nPLAN: GOAL: a\nPHASE 1: z")
+        assertEquals("GOAL: a", s["MEMORY"])
+        assertEquals("GOAL: a\nPHASE 1: z", s["PLAN"])
+    }
+
+    @Test fun theStatusAnswerMentionsAWaitingQuestion() {
+        val b = Brain(last = failedRun, pending = Pending("r", "Which colors?"))
+        assertTrue(BrainOps.statusText(b, false).contains("Waiting for your answer: Which colors?"))
+        assertTrue(BrainOps.statusText(b, true).contains("আপনার উত্তরের অপেক্ষায়"))
+    }
 }

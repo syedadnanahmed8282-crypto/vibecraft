@@ -56,7 +56,9 @@ import androidx.compose.ui.unit.sp
 import com.vibecraft.app.AppVm
 import com.vibecraft.app.Step
 import com.vibecraft.app.data.MessageEntity
+import com.vibecraft.app.gen.Brain
 import com.vibecraft.app.gen.ChatItem
+import com.vibecraft.app.gen.Intents
 import com.vibecraft.app.gen.Changes
 import com.vibecraft.app.gen.Notes
 import com.vibecraft.app.gen.Plain
@@ -83,7 +85,12 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpenCode: () -> U
     val state = rememberLazyListState()
     val thinking = id != null && vm.thinkingId == id
     val rows = remember(msgs) { Notes.group(msgs.map { RawMsg(it.id, it.role, it.content) }) }
-    LaunchedEffect(rows.size, thinking) { if (rows.isNotEmpty()) state.animateScrollToItem(rows.size - 1 + if (thinking) 1 else 0) }
+    val brain by remember(id) { if (id != null) vm.brainFlow(id) else flowOf(Brain()) }.collectAsState(initial = Brain())
+    val last = rows.lastOrNull()
+    val waiting = !thinking && last is Plain && last.msg.role == "assistant" && (brain.planState == "draft" || brain.pending != null)
+    val lastUser = msgs.lastOrNull { it.role == "user" }?.content ?: ""
+    val bn = Intents.isBengali(Quoting.decode(lastUser)?.text ?: lastUser)
+    LaunchedEffect(rows.size, thinking, waiting) { if (rows.isNotEmpty()) state.animateScrollToItem(rows.size - 1 + if (thinking || waiting) 1 else 0) }
 
     fun send(t: String) {
         if (vm.thinkingId != null) return
@@ -152,6 +159,13 @@ fun ChatTab(vm: AppVm, openId: String?, onSetup: () -> Unit, onOpenCode: () -> U
                             }
                         }
                     }
+                }
+                if (waiting) item(key = "quick") {
+                    QuickReply(
+                        bn,
+                        onOk = { send(if (bn) "ঠিক আছে, তোমার প্রস্তাব অনুযায়ী এগিয়ে যাও" else "OK, go ahead with your suggestions") },
+                        onChange = { runCatching { focus.requestFocus() } },
+                    )
                 }
                 if (thinking) item(key = "typing") { if (vm.steps.isEmpty()) TypingDots() else StepsCard(vm.steps) }
             }
@@ -530,5 +544,20 @@ private fun SwipeReply(fromStart: Boolean, onReply: () -> Unit, content: @Compos
             Alignment.Center,
         ) { Icon(Ic.Reply, "Reply", Modifier.size(18.dp), tint = c.ac) }
         Box(Modifier.graphicsLayer { translationX = pull.value * dir }) { content() }
+    }
+}
+
+/** Shown only while the AI waits for an answer (the plan questions or a decision): one tap to accept its suggestions. */
+@Composable
+private fun QuickReply(bn: Boolean, onOk: () -> Unit, onChange: () -> Unit) {
+    val c = VCT.c
+    val pill = RoundedCornerShape(999.dp)
+    Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.clip(pill).background(c.g).clickable(onClick = onOk).padding(horizontal = 16.dp, vertical = 9.dp)) {
+            Text(if (bn) "ঠিক আছে, শুরু করো" else "OK, go ahead", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Box(Modifier.clip(pill).background(c.sf).border(1.dp, c.bd, pill).clickable(onClick = onChange).padding(horizontal = 16.dp, vertical = 9.dp)) {
+            Text(if (bn) "কিছু বদলাতে চাই" else "Change something", color = c.tx, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        }
     }
 }

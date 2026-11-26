@@ -64,6 +64,13 @@ object AiClient {
         "When the user's message starts with 'The user is replying to this earlier message', that quoted message is exactly what words like this, that, it, ok, do it, দাও, ঠিক করো refer to: " +
         "read the quote first, then answer or act on it directly (a quoted problem means find the cause and fix it, a quoted proposal the user accepts means do it now, " +
         "a quoted answer they question means explain or correct it). Never ask which message they mean. " +
+        "Use 'INTENT: ASK' instead of acting when the user should decide or know something first: the request changes or contradicts the approved plan or an earlier decision; " +
+        "a choice has big consequences (deleting or rewriting many files, changing the app's name, icon, theme or structure, adding a permission or a dependency); " +
+        "something essential is missing and cannot be guessed safely; or there is something important to tell the user before you start. " +
+        "Do not ask about small details: decide those yourself. With INTENT: ASK write, right after that line, a short message in the user's language: " +
+        "what you found or want to do, the choices with your recommendation, and at most 3 short questions the user can answer with one word or 'ok'. " +
+        "No FILE lines. When the message says the user already answered, act and do not ask the same thing again. " +
+        "If the memory or the approved plan has a NAME or an ICON idea, follow them exactly and use that name in APP_NAME. " +
         "With INTENT: ANSWER write the answer right after that line, in a few clear sentences, using the memory, the tasks, the events and the files, and no FILE lines. " +
         "With INTENT: ACT, after that line reply in EXACTLY this format and nothing else: " +
         "a first line 'SUMMARY: ' with one or two friendly sentences saying what you are about to do (future tense, for example 'I will add...'); " +
@@ -140,22 +147,39 @@ object AiClient {
         "COMMIT: a git commit message in English, imperative mood, under 60 characters. " +
         "SUMMARY: two or three short friendly sentences in the language the user wrote, saying what you did, which problem there was (if any) " +
         "and that it was fixed, or what is still open. No code and no markdown. " +
-        "MEMORY: the updated project memory, at most 1200 characters, as short lines that start with GOAL:, DECISIONS:, DESIGN:, USER: or OPEN:. " +
+        "MEMORY: the updated project memory, at most 1200 characters, as short lines that start with GOAL:, NAME:, ICON:, DECISIONS:, DESIGN:, USER: or OPEN:. " +
         "The USER line records the user's language, how they like to work, and the words they use for things (for example এপিকে = APK). " +
-        "Keep earlier facts that are still true, add what was said or done in this task, remove what is outdated. Facts only, no guesses."
+        "Keep earlier facts that are still true, add what was said or done in this task, remove what is outdated. Facts only, no guesses. " +
+        "After MEMORY, add a section 'PLAN:' only when this task changed the approved plan (a feature added to it, a phase finished or reordered, a decision that changes it): " +
+        "then give the complete updated plan with the same lines as the approved plan (GOAL, NAME, ICON, DESIGN, SCREENS, FEATURES, PHASE 1.. lines). Otherwise leave PLAN out."
 
     /** A memory refresh without any code change. */
     const val SYS_MEMORY = "You keep the memory of a coding project for an assistant. You get the current memory and the recent conversation. " +
-        "Reply with ONLY the updated memory, at most 1200 characters, as short lines that start with GOAL:, DECISIONS:, DESIGN:, USER: or OPEN:. " +
+        "Reply with ONLY the updated memory, at most 1200 characters, as short lines that start with GOAL:, NAME:, ICON:, DECISIONS:, DESIGN:, USER: or OPEN:. " +
         "The USER line records the user's language, how they like to work, and the words they use for things. " +
         "Keep earlier facts that are still true, add new facts the user stated or the assistant did, remove what is outdated. Facts only, no guesses."
 
-    /** The plan a user approves before a new app is built. */
+    /** The first plan for a new app: shown with questions before anything is built. */
     const val SYS_BRIEF = "You plan a new Android app with Kotlin and Jetpack Compose together with the user, before any code is written. " +
-        "Reply in the language the user wrote, with these lines: GOAL: one sentence. SCREENS: the screens, separated by commas. " +
-        "FEATURES: the main features, separated by commas. DESIGN: the look in one sentence (style, colors, mood). " +
+        "Reply in the language the user wrote (Bengali if they wrote Bengali), with exactly these lines and no code: " +
+        "GOAL: one sentence. NAME: your suggested app name of one or two words (the user's own name if they gave one). " +
+        "ICON: the logo idea in one short sentence (shape and colors). DESIGN: the look in one sentence (style, colors, light or dark). " +
+        "SCREENS: the screens, separated by commas. FEATURES: the main features, separated by commas, the simplest first. " +
         "Then 3 to 5 lines 'PHASE 1: ...', 'PHASE 2: ...' where each phase is one small buildable step and phase 1 already gives a working app. " +
-        "Add one line 'QUESTION: ...' only if something essential is missing. No code."
+        "Then a line 'QUESTIONS:' followed by 2 to 4 short numbered questions about what you cannot guess well, for example the app name and logo if the user has an idea, " +
+        "the colors or style, extra features, the language of the app; put your own suggestion in brackets after each question so the user can simply answer 'ok'. " +
+        "End with one friendly sentence: the user can answer the questions, change anything, or say ok to start with your suggestions. " +
+        "If the message is not a request to build an app, just answer it normally without these lines."
+
+    /** The plan is fixed after the user's answers; the app then saves it and starts building. */
+    const val SYS_FINALIZE = "You finalize the plan of a new Android app after the user answered your questions. Reply in the language the user wrote. " +
+        "The first line is exactly 'STATUS: READY', 'STATUS: ASK' or 'STATUS: CANCEL'. " +
+        "READY: you can fix the plan now; use your own suggestions for anything the user left unanswered, or when they just said ok. " +
+        "After that line write the final plan with exactly these lines: GOAL:, NAME: (one final name), ICON:, DESIGN:, SCREENS:, FEATURES:, " +
+        "then 3 to 5 lines 'PHASE 1: ...', 'PHASE 2: ...', and optionally NOTES: the decisions the user made, in one line. " +
+        "Then one friendly sentence saying you are starting to build now. " +
+        "ASK: an answer is missing or unclear and a short follow-up is really needed; write only at most 3 short questions, each with your suggestion in brackets. " +
+        "CANCEL: the user does not want this app any more; write one friendly sentence. No code."
 
     const val SYSTEM = SYS_PLAN
 

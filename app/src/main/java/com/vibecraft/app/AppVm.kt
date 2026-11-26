@@ -1,6 +1,7 @@
 package com.vibecraft.app
 
 import android.app.Application
+import android.os.Build
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -37,6 +38,13 @@ import com.vibecraft.app.gen.EditResult
 import com.vibecraft.app.gen.History
 import com.vibecraft.app.gen.Intent
 import com.vibecraft.app.gen.Notes
+import com.vibecraft.app.gen.NoticeKind
+import com.vibecraft.app.gen.NoticeText
+import com.vibecraft.app.gen.PhaseView
+import com.vibecraft.app.notify.Chime
+import com.vibecraft.app.notify.Notifier
+import com.vibecraft.app.gen.Pending
+import com.vibecraft.app.gen.SummaryOut
 import com.vibecraft.app.gen.Problem
 import com.vibecraft.app.gen.Quoting
 import com.vibecraft.app.gen.Intents
@@ -272,6 +280,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     private suspend fun addMsg(projectId: String, role: String, text: String) {
         if (role == "note" && !text.startsWith("FILE|") && !text.startsWith("ERR|") && !text.startsWith("PAUSE|")) lastNote = text
+        if (role == "assistant") lastAssistant = text
         val now = System.currentTimeMillis()
         dao.putMessage(MessageEntity(UUID.randomUUID().toString(), projectId, role, text, now))
         dao.project(projectId)?.let { dao.putProject(it.copy(updatedAt = now, dirty = true)) }
@@ -283,11 +292,73 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     private var aiCalls = 0
     private var lastNote: String? = null
     private var lastErr: Problem? = null
+    private var planText = ""
     private var deferErr = false
     private var fileDescs: Map<String, String> = emptyMap()
 
     var planFirst by mutableStateOf(prefs.getBoolean("plan_first", true)); private set
     fun changePlanFirst(on: Boolean) { planFirst = on; prefs.edit().putBoolean("plan_first", on).apply() }
+
+    // ---- background work, notifications and sounds ----
+    private val appCtx: Application get() = getApplication<Application>()
+    var notifyOn by mutableStateOf(prefs.getBoolean("notify_on", true)); private set
+    var soundOn by mutableStateOf(prefs.getBoolean("sound_on", true)); private set
+    var notifyAllowed by mutableStateOf(Notifier.canPost(app)); private set
+    var askNotifyPermission by mutableStateOf(false)
+    var openRequest by mutableStateOf<String?>(null)
+
+    fun changeNotify(on: Boolean) { notifyOn = on; prefs.edit().putBoolean("notify_on", on).apply() }
+    fun changeSound(on: Boolean) { soundOn = on; prefs.edit().putBoolean("sound_on", on).apply() }
+    fun refreshNotifyState() { notifyAllowed = Notifier.canPost(appCtx) }
+    fun onNotifyPermissionResult(granted: Boolean) {
+        askNotifyPermission = false
+        prefs.edit().putBoolean("notify_asked", true).apply()
+        refreshNotifyState()
+    }
+    fun declineNotifyPrompt() { askNotifyPermission = false; prefs.edit().putBoolean("notify_asked", true).apply() }
+
+    private fun maybeAskNotifyPermission() {
+        if (Build.VERSION.SDK_INT >= 33 && !Notifier.canPost(appCtx) && !prefs.getBoolean("notify_asked", false)) askNotifyPermission = true
+    }
+
+    /** The settings button: shows exactly how a notification will look and sound. */
+    fun testNotification() {
+        if (!Notifier.canPost(appCtx)) {
+            if (!prefs.getBoolean("notify_asked", false)) askNotifyPermission = true else Notifier.openSettings(appCtx)
+            return
+        }
+        Notifier.post(
+            appCtx, null,
+            NoticeText.build(NoticeKind.DONE, "Vibecraft", false, "This is how Vibecraft will tell you when a task is done.", "Test notification"),
+            silent = !soundOn,
+        )
+    }
+
+    private var runName = "Vibecraft"
+    private var runBn = false
+    private var serviceOn = false
+    private var lastAssistant: String? = null
+
+    /** Starts the background service the first time the AI is really called in a run, so quick answers never flash a notification. */
+    private fun ensureRunService() {
+        if (serviceOn) return
+        serviceOn = true
+        Notifier.runStarted(appCtx, NoticeText.progress(emptyList(), runName, runBn))
+    }
+
+    /** Tells the user: a system notification with its own sound when the app is away, the same sound inside the app otherwise. */
+    private suspend fun alert(kind: NoticeKind, projectId: String, detail: String, extra: String = "") {
+        if (Notifier.foreground) {
+            if (soundOn && kind != NoticeKind.REPLY) Chime.play(kind)
+            return
+        }
+        if (!notifyOn) return
+        val name = dao.project(projectId)?.name ?: "Vibecraft"
+        Notifier.post(
+            appCtx, projectId, NoticeText.build(kind, name, runBn, detail, extra), silent = !soundOn,
+            okLabel = NoticeText.okLabel(runBn), okText = NoticeText.okText(runBn),
+        )
+    }
 
     /** What the app remembers about a project: memory, brief, roadmap, tasks, last run. Stored in the project itself. */
     fun brainFlow(id: String): Flow<Brain> = dao.files(id).map { rows -> BrainOps.parse(rows.firstOrNull { it.path == BrainOps.PATH }?.content) }
@@ -309,6 +380,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     private fun pushPhases() {
         steps = List(6) { i -> Step(phaseNames[i], phState[i], phaseKeys[i], phSub[i], if (i == 3) phProgress else -1f, phStart[i]) }
+        if (serviceOn) {
+            Notifier.runProgress(appCtx, NoticeText.progress(steps.map { PhaseView(it.label, it.state, it.phase, it.sub, it.progress) }, runName, runBn))
+        }
     }
 
     private fun resetPhases() {
@@ -331,12 +405,16 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     /** Asks the active model and moves to the next profile when one is out of quota. Null means it could not answer. */
     private suspend fun askModel(projectId: String, system: String, msgs: List<Pair<String, String>>, quiet: Boolean = false): Reply? {
+        ensureRunService()
         suspend fun say(t: String) { if (!quiet) addMsg(projectId, "note", t) }
         // A terminal error is kept for the closing card; while files are being written it is not shown twice.
         suspend fun fail(kind: String, title: String, sub: String, raw: String) {
             lastErr = Problem(kind, title, sub, raw)
             lastNote = title
-            if (!quiet && !deferErr) addMsg(projectId, "note", Notes.err(kind, title, sub, raw))
+            if (!quiet && !deferErr) {
+                addMsg(projectId, "note", Notes.err(kind, title, sub, raw))
+                alert(NoticeKind.PROBLEM, projectId, title + if (sub.isBlank()) "" else ". $sub")
+            }
         }
         val sel = ProviderOrder.choose(
             profiles.map { Candidate(it.id, it.name, store.key(it.id) != null, it.dailyLimit, store.used(it.id)) },
@@ -458,6 +536,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         val ctx = buildString {
             append("What the user asked:\n").append(request).append("\n\nPlan: ").append(plan.summary).append("\nFiles in this change:\n")
             plan.files.forEach { append("- ").append(it.path).append(": ").append(it.desc).append('\n') }
+            if (planText.isNotBlank()) append("\nApproved plan (follow it, including the name, the icon idea and the design):\n").append(planText).append('\n')
             written.forEach { (p, c) ->
                 if (p != pf.path) append("\nAlready written in this change, ").append(p).append(":\n```\n").append(c.take(4000)).append("\n```\n")
             }
@@ -539,8 +618,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     /** Closing note: what was done, the commit message for GitHub, and the updated project memory (returned). */
     private suspend fun summarize(
         projectId: String, request: String, plan: Plan, changed: List<String>, deleted: List<String>,
-        fixRounds: Int, warnings: List<String>, version: Int, memory: String, recent: List<String>,
-    ): String? {
+        fixRounds: Int, warnings: List<String>, version: Int, memory: String, brief: String, recent: List<String>,
+    ): SummaryOut? {
         val prompt = buildString {
             append("User request:\n").append(request).append("\n\nPlan: ").append(plan.summary)
             append("\nFiles changed: ").append(changed.joinToString(", ").ifBlank { "none" })
@@ -549,6 +628,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             append(if (fixRounds > 0) "yes, in $fixRounds round(s)" else "none")
             append("\nRemaining warnings: ").append(if (warnings.isEmpty()) "none" else warnings.take(3).joinToString("; "))
             append("\n\nCurrent memory:\n").append(memory.ifBlank { "(empty)" })
+            if (brief.isNotBlank()) append("\n\nApproved plan:\n").append(brief.take(1800))
             append("\n\nRecent user messages:\n").append(recent.joinToString("\n") { "- " + it.take(200) })
         }
         val r = askModel(projectId, AiClient.SYS_SUMMARY, listOf("user" to prompt), quiet = true) ?: return null
@@ -559,7 +639,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         if (!commitLine.isNullOrBlank()) {
             dao.checkpointsOnce(projectId).firstOrNull { it.version == version }?.let { dao.putCheckpoint(it.copy(title = commitLine, dirty = true)) }
         }
-        return sec["MEMORY"]?.takeIf { it.isNotBlank() }?.take(1500)
+        return SummaryOut(sec["MEMORY"]?.takeIf { it.isNotBlank() }?.take(1500), sec["PLAN"]?.takeIf { BrainOps.parsePhases(it).isNotEmpty() })
     }
 
     /** A memory refresh after a few answers that changed no code. */
@@ -571,19 +651,58 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         return brain.copy(memory = if (t.isBlank()) brain.memory else t.take(1500), sinceMemory = 0)
     }
 
-    /** A new app starts with a short plan the user approves; later steps follow it. */
-    private suspend fun briefFlow(projectId: String, history: List<Pair<String, String>>, brain: Brain, bn: Boolean) {
+    /** A new app starts with a plan and a few questions. Nothing is built until the user has answered. */
+    private suspend fun briefFlow(projectId: String, history: List<Pair<String, String>>, brain: Brain) {
         phase(0, 2); phase(2, 1, "drafting the plan")
         val r = askModel(projectId, AiClient.SYS_BRIEF, history) ?: return
         phase(2, 2)
         val text = r.text.trim()
-        val phases = Regex("(?im)^\\s*PHASE\\s*\\d+\\s*:\\s*.+$").findAll(text).map { it.value.trim() }.toList().take(6)
+        val phases = BrainOps.parsePhases(text)
         if (phases.isEmpty()) {
             addMsg(projectId, "assistant", text.ifBlank { "(empty reply)" })
+            alert(NoticeKind.REPLY, projectId, text)
             return
         }
-        saveBrain(projectId, brain.copy(brief = text.take(2500), roadmap = phases.map { Task(it) }))
-        addMsg(projectId, "assistant", text + "\n\n" + if (bn) "ঠিক থাকলে \"দাও\" লিখুন, বদলাতে চাইলে বলুন।" else "Say \"ok\" to start, or tell me what to change.")
+        saveBrain(projectId, brain.copy(planState = "draft", planRounds = 0, brief = text.take(2500), roadmap = phases.map { Task(it) }))
+        addMsg(projectId, "assistant", text)
+        alert(NoticeKind.ASK, projectId, text.substringAfter("QUESTIONS:", text))
+    }
+
+    /** The user answered the questions: fix the final plan, save it as the project's memory, and let the work start. */
+    private suspend fun finalizeFlow(projectId: String, brain: Brain, userText: String, bn: Boolean): Brain? {
+        phase(0, 2); phase(2, 1, "fixing the plan with your answers")
+        val prompt = buildString {
+            append("The plan that was proposed to the user:\n").append(brain.brief)
+            append("\n\nThe user's answer:\n").append(userText)
+            if (brain.planRounds >= 2) append("\n\nYou have already asked twice: STATUS must be READY now. Use your suggestions for anything unanswered.")
+        }
+        val r = askModel(projectId, AiClient.SYS_FINALIZE, listOf("user" to prompt)) ?: return null
+        phase(2, 2)
+        val status = BrainOps.status(r.text)
+        val body = r.text.lines().dropWhile { it.isBlank() || it.trim().startsWith("STATUS:", ignoreCase = true) }.joinToString("\n").trim()
+        val phases = BrainOps.parsePhases(body)
+        if (status == "CANCEL") {
+            addMsg(projectId, "assistant", body.ifBlank { if (bn) "ঠিক আছে, বাদ দিলাম।" else "Okay, I dropped it." })
+            saveBrain(projectId, brain.copy(planState = "", planRounds = 0, brief = "", roadmap = emptyList()))
+            return null
+        }
+        if (status == "ASK" || (status == null && phases.isEmpty())) {
+            addMsg(projectId, "assistant", body.ifBlank { r.text.trim().ifBlank { "(empty reply)" } })
+            saveBrain(projectId, brain.copy(planRounds = brain.planRounds + 1))
+            alert(NoticeKind.ASK, projectId, body.ifBlank { r.text })
+            return null
+        }
+        val lines = BrainOps.planLines(body).ifBlank { body }
+        BrainOps.field(lines, "NAME")?.let { BrainOps.cleanName(it) }?.takeIf { it.isNotBlank() }?.let { name ->
+            dao.project(projectId)?.let { dao.putProject(it.copy(name = name, updatedAt = System.currentTimeMillis(), dirty = true)) }
+        }
+        val ready = brain.copy(
+            planState = "ready", planRounds = 0, brief = lines.take(2500), roadmap = phases.map { Task(it) },
+            memory = BrainOps.memoryFromPlan(lines, bn), active = if (phases.isNotEmpty()) 0 else -1,
+        )
+        saveBrain(projectId, ready)
+        addMsg(projectId, "assistant", body)
+        return ready
     }
 
     /** Words that suggest the user is reporting something broken rather than asking a question. */
@@ -613,7 +732,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         thinkingId = projectId
         lastNote = null
         resetPhases(); phase(0, 1, "your request and project files")
-        lastErr = null; deferErr = false; fileDescs = emptyMap()
+        lastErr = null; deferErr = false; fileDescs = emptyMap(); lastAssistant = null
         try {
             val all = dao.messagesOnce(projectId)
             val rawTyped = all.lastOrNull { it.role == "user" }?.content ?: ""
@@ -623,15 +742,38 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             var origRequest = typed
             var brain = loadBrain(projectId)
             val bn = Intents.isBengali(typed)
+            runBn = bn
+            runName = dao.project(projectId)?.name ?: "Vibecraft"
+            maybeAskNotifyPermission()
 
             // 1. "What happened?" is answered from what the app really recorded: instant, exact, no AI call.
             if (Intents.quickStatus(typed) && brain.last != null && replied == null) {
                 addMsg(projectId, "assistant", BrainOps.statusText(brain, bn))
                 return
             }
-            // 2. A bare "ok / continue / fix it" picks up the unfinished work instead of starting over.
+            // 2a. The plan was shown with questions: this message is the user's answer. Fix the plan, save it, then build.
+            var finalized = false
+            if (brain.planState == "draft") {
+                val ready = finalizeFlow(projectId, brain, typed, bn) ?: return
+                brain = ready
+                finalized = true
+                request = "Build the app now, following the approved plan. Start with phase 1."
+                origRequest = ready.roadmap.firstOrNull()?.title ?: typed
+            }
+            // 2b. The AI asked something before acting (a plan change or an important decision): this message is the answer.
+            var askRounds = 0
+            val pend = brain.pending
+            if (!finalized && pend != null) {
+                askRounds = pend.rounds
+                request = "Earlier request: ${pend.request}\nYou asked the user: ${pend.question}\nThe user answered: $typed\n" +
+                    "Now carry out the request according to the answer. " +
+                    if (pend.rounds >= 2) "Do not ask again: decide yourself." else "Do not ask the same thing again."
+                origRequest = pend.request
+                brain = brain.copy(pending = null)
+            }
+            // 2c. A bare "ok / continue / fix it" picks up the unfinished work instead of starting over.
             val next = BrainOps.next(brain)
-            val resuming = next != null && replied == null && Intents.quickResume(typed)
+            val resuming = !finalized && pend == null && next != null && replied == null && Intents.quickResume(typed)
             if (resuming && next != null) {
                 origRequest = brain.last?.request ?: typed
                 request = "Continue the unfinished task: ${next.title}" + (brain.last?.request?.let { ". Original request: $it" } ?: "")
@@ -647,11 +789,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val isNewApp = current.keys.none { it.endsWith(".kt") }
 
             // 3. A new app starts with a short plan the user approves, so later steps stay consistent with it.
-            if (planFirst && isNewApp && brain.brief.isBlank() && next == null && request.length >= 15 && !Intents.skipPlan(request)) {
-                briefFlow(projectId, history, brain, bn)
+            if (planFirst && isNewApp && brain.planState.isEmpty() && brain.brief.isBlank() && next == null && request.length >= 15 && !Intents.skipPlan(request)) {
+                briefFlow(projectId, history, brain)
                 return
             }
 
+            planText = if (brain.planState != "draft") BrainOps.planLines(brain.brief).lines().filter { !it.trim().startsWith("PHASE", ignoreCase = true) }.joinToString("\n").take(1000) else ""
             val events = eventsBefore(all)
             val sys = AiClient.SYS_PLAN + "\n\n" + BrainOps.render(brain) + "\n\n" +
                 (if (events.isEmpty()) "" else "App events since your last answer (what really happened):\n" + events.joinToString("\n") { "- $it" } + "\n\n") +
@@ -673,7 +816,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 intent = Intents.parseLine(text)
             }
             // "Check it" never changes files: if the AI planned changes anyway, ask for the check result instead.
-            val reviewOnly = Intents.looksLikeReview(typed) && !resuming
+            val reviewOnly = Intents.looksLikeReview(typed) && !resuming && !finalized && pend == null
             if (reviewOnly && (plan.files.isNotEmpty() || plan.deletes.isNotEmpty())) {
                 val again = askModel(
                     projectId, sys,
@@ -685,7 +828,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 intent = Intent.ANSWER
             }
             // A problem report or a confirmation answered with advice only: ask once more for the work itself.
-            if (!reviewOnly && plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isEmpty() &&
+            if (!reviewOnly && intent != Intent.ASK && plan.files.isEmpty() && plan.deletes.isEmpty() && plan.reads.isEmpty() &&
                 CodeBlocks.files(text).isEmpty() && (looksLikeProblem(typed) || looksLikeConfirmation(typed))
             ) {
                 val again = askModel(
@@ -697,6 +840,17 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 if (again != null) { text = again.text; plan = PlanParser.parse(text); intent = Intents.parseLine(text) }
             }
 
+            // The AI wants the user to decide or know something before it acts: it asks, and waits for the answer.
+            if (intent == Intent.ASK && plan.files.isEmpty() && plan.deletes.isEmpty() && askRounds < 2) {
+                val ask = Intents.stripControl(text).ifBlank {
+                    if (bn) "কাজ শুরুর আগে একটা সিদ্ধান্ত দরকার। কীভাবে এগোব?" else "I need your decision before I start. How should I go on?"
+                }
+                addMsg(projectId, "assistant", ask)
+                brain = brain.copy(pending = Pending(origRequest, ask.take(600), askRounds + 1), sinceMemory = brain.sinceMemory + 1)
+                saveBrain(projectId, brain)
+                alert(NoticeKind.ASK, projectId, ask)
+                return
+            }
             if (intent == Intent.ANSWER || (plan.files.isEmpty() && plan.deletes.isEmpty())) {
                 // An answer, or a model that ignored the format and sent code blocks anyway.
                 val found = if (intent == Intent.ANSWER) emptyList() else CodeBlocks.files(text).filter { Protect.canWrite(it.first) }
@@ -704,6 +858,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 val shown = if (found.isNotEmpty()) CodeBlocks.stripBlocks(text).ifBlank { "Done." } else Intents.stripControl(text).ifBlank { fallback }
                 addMsg(projectId, "assistant", shown)
                 if (found.isNotEmpty()) commit(projectId, found, emptyList(), origRequest)
+                alert(if (found.isNotEmpty()) NoticeKind.DONE else NoticeKind.REPLY, projectId, shown, if (found.isNotEmpty()) "Code updated" else "")
                 brain = brain.copy(sinceMemory = brain.sinceMemory + 1)
                 if (brain.sinceMemory >= 4) brain = refreshMemory(projectId, brain, history + ("assistant" to shown))
                 saveBrain(projectId, brain)
@@ -717,12 +872,14 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 }
             }
             // A new app always gets its own icon; the design tokens come first and the preview goes last.
+            val iconHint = BrainOps.field(brain.memory, "ICON")?.let { ": $it" } ?: ""
+            val designHint = BrainOps.field(brain.memory, "DESIGN")?.let { " (" + it.take(120) + ")" } ?: ""
             val icons = if (isNewApp) {
-                listOf(Template.ICON_FG to "app icon artwork", Template.ICON_COLORS to "icon background color")
+                listOf(Template.ICON_FG to "app icon artwork$iconHint", Template.ICON_COLORS to "icon background color$iconHint")
                     .filter { (p, _) -> plan.files.none { it.path == p } }.map { PlanFile(it.first, it.second) }
             } else emptyList()
             val designPlan = plan.files.firstOrNull { it.path == "design.json" }
-                ?: if (isNewApp) PlanFile("design.json", "design tokens: colors, text sizes, spacing, corners") else null
+                ?: if (isNewApp) PlanFile("design.json", "design tokens: colors, text sizes, spacing, corners$designHint") else null
             val previewPlan = plan.files.firstOrNull { it.path == "preview.html" }
             var files = listOfNotNull(designPlan) + plan.files.filter { it.path != "preview.html" && it.path != "design.json" } + icons
             val hasPreview = current.containsKey("preview.html") || current.containsKey("preview/index.html") || files.any { it.path.startsWith("preview/") }
@@ -824,6 +981,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
             var version: Int? = null
             var newMemory: String? = null
+            var newPlan: String? = null
             if (written.isNotEmpty() || deletes.isNotEmpty()) {
                 phase(5, 1, "your changes")
                 version = commit(projectId, written.toList(), deletes, origRequest)
@@ -832,17 +990,19 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     addMsg(projectId, "note", "Saved with warnings: " + warnings.take(3).joinToString("; "))
                 }
                 if (version != null) {
-                    newMemory = summarize(projectId, request, plan, written.keys.toList(), deletes, fixRounds, warnings, version, brain.memory, recentUser)
+                    val so = summarize(projectId, request, plan, written.keys.toList(), deletes, fixRounds, warnings, version, brain.memory, brain.brief, recentUser)
+                    newMemory = so?.memory
+                    newPlan = so?.plan
                 }
             }
             val e = lastErr
             if (failedAt != null) {
-                addMsg(
-                    projectId, "note",
-                    Notes.pause(e?.kind ?: "other", e?.title ?: "Writing stopped at $failedAt", e?.sub ?: "", e?.raw ?: "", written.size, files.size, failedAt),
-                )
+                val pp = Problem(e?.kind ?: "other", e?.title ?: "Writing stopped at $failedAt", e?.sub ?: "", e?.raw ?: "", written.size, files.size, failedAt)
+                addMsg(projectId, "note", Notes.pause(pp.kind, pp.title, pp.sub, pp.raw, pp.done, pp.total, pp.stoppedAt))
+                alert(NoticeKind.PROBLEM, projectId, Notes.problemText(pp))
             } else if (e != null && results.any { it.endsWith("failed") }) {
                 addMsg(projectId, "note", Notes.err(e.kind, e.title, e.sub, e.raw))
+                alert(NoticeKind.PROBLEM, projectId, e.title + if (e.sub.isBlank()) "" else ". " + e.sub)
             }
 
             // What the app records here is what "what happened?" is answered from, and what "continue" resumes.
@@ -855,18 +1015,38 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 roadmap = roadmap.mapIndexed { j, t -> if (j == active) t.copy(state = TaskState.DONE) else t }
                 active = -1
             }
+            // A plan that changed during the task replaces the old one; phases already done stay done.
+            var briefText = brain.brief
+            newPlan?.let { np ->
+                val lines = BrainOps.planLines(np)
+                if (lines.isNotBlank()) {
+                    briefText = lines.take(2500)
+                    roadmap = BrainOps.mergeRoadmap(roadmap, BrainOps.parsePhases(np))
+                    if (active >= roadmap.size) active = -1
+                }
+            }
             brain = brain.copy(
-                tasks = left, roadmap = roadmap, active = active,
+                tasks = left, roadmap = roadmap, active = active, brief = briefText,
                 memory = newMemory ?: brain.memory,
                 sinceMemory = if (newMemory != null) 0 else brain.sinceMemory + 1,
                 last = RunReport(origRequest.take(200), plan.summary.take(200), results, version, problem, System.currentTimeMillis()),
             )
             saveBrain(projectId, brain)
+            if (failedAt == null) {
+                val n = written.size + deletes.size
+                if (version != null) {
+                    alert(NoticeKind.DONE, projectId, lastAssistant ?: plan.summary, "$n change${if (n == 1) "" else "s"} saved · v$version")
+                } else {
+                    alert(NoticeKind.REPLY, projectId, lastAssistant ?: plan.summary)
+                }
+            }
         } finally {
             thinkingId = null
             steps = emptyList()
             deferErr = false
             fileDescs = emptyMap()
+            planText = ""
+            if (serviceOn) { serviceOn = false; Notifier.runEnded(appCtx) }
         }
     }
 

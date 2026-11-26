@@ -29,8 +29,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vibecraft.app.AppVm
 import com.vibecraft.app.ai.Profile
+import com.vibecraft.app.notify.Notifier
 
-internal const val APP_VERSION = "0.13.0"
+internal const val APP_VERSION = "0.15.0"
 internal const val CLASSIC_TOKEN_URL = "https://github.com/settings/tokens/new?scopes=repo,workflow&description=Vibecraft"
 internal const val FINE_TOKEN_URL = "https://github.com/settings/personal-access-tokens/new"
 
@@ -115,6 +116,21 @@ fun SettingsPanel(vm: AppVm, section: String?, onSection: (String?) -> Unit) {
                 Text("Plan first for new apps", color = c.tx, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                 VcSwitch(vm.planFirst) { vm.changePlanFirst(it) }
             }
+            Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Notifications", color = c.tx, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                VcSwitch(vm.notifyOn) { vm.changeNotify(it) }
+            }
+            Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Sounds", color = c.tx, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                VcSwitch(vm.soundOn) { vm.changeSound(it) }
+            }
+            Text(
+                if (vm.notifyAllowed) "Vibecraft keeps working in the background and tells you when a task is done, when it needs you, or when something goes wrong."
+                else "Android is blocking notifications for Vibecraft. Allow them in the system settings to hear back when you leave the app.",
+                color = if (vm.notifyAllowed) c.mu else Color(0xFFE0564A), fontSize = 11.5.sp, modifier = Modifier.padding(top = 8.dp),
+            )
+            VcButton("Send a test notification", { vm.testNotification() }, Modifier.padding(top = 10.dp).fillMaxWidth(), secondary = true, icon = Ic.Bell)
+            VcButton("System notification settings", { Notifier.openSettings(ctx) }, Modifier.padding(top = 8.dp).fillMaxWidth(), secondary = true, icon = Ic.Gear)
         }
 
         // ---- GitHub token ----

@@ -20,6 +20,13 @@ data class RunReport(
  * Everything the app remembers about a project besides its files: the AI-kept memory, the approved brief,
  * the roadmap, unfinished tasks and the last run. Stored in the project (so it syncs and survives a reinstall).
  */
+/** A question the AI asked before acting, waiting for the user's answer. rounds counts how often it asked in a row. */
+@Serializable
+data class Pending(val request: String, val question: String, val rounds: Int = 1)
+
+/** What the closing note of a task gave back: the new memory and, only when the plan changed, the new plan. */
+data class SummaryOut(val memory: String?, val plan: String?)
+
 @Serializable
 data class Brain(
     val memory: String = "",
@@ -29,6 +36,10 @@ data class Brain(
     val last: RunReport? = null,
     val active: Int = -1,
     val sinceMemory: Int = 0,
+    /** "" = no plan step, "draft" = the plan and questions were shown and the user has not answered, "ready" = approved. */
+    val planState: String = "",
+    val planRounds: Int = 0,
+    val pending: Pending? = null,
 )
 
 data class NextTask(val title: String, val roadmapIndex: Int?)
@@ -60,7 +71,7 @@ object BrainOps {
     /** The memory block that goes into every request. */
     fun render(b: Brain): String = buildString {
         append("Project memory:\n").append(b.memory.ifBlank { "(nothing yet)" }).append('\n')
-        if (b.brief.isNotBlank()) append("\nApproved brief:\n").append(b.brief.take(1800)).append('\n')
+        if (b.brief.isNotBlank()) append("\nApproved plan:\n").append(b.brief.take(1800)).append('\n')
         if (b.roadmap.isNotEmpty()) {
             append("\nRoadmap:\n")
             b.roadmap.forEach { append("- [").append(mark(it)).append("] ").append(it.title).append('\n') }
@@ -99,10 +110,46 @@ object BrainOps {
                 append("Unfinished: ").append(if (unfinished.isEmpty()) "none" else unfinished.take(4).joinToString("; "))
                 if (unfinished.isNotEmpty()) append("\nSay \"continue\" to pick it up.")
             }
+            b.pending?.let { append(if (bengali) "\nআপনার উত্তরের অপেক্ষায়: " else "\nWaiting for your answer: ").append(Quoting.preview(it.question, 100)) }
         }
     }
 
-    private val sectionRe = Regex("(?im)^\\s*(COMMIT|SUMMARY|MEMORY):\\s*")
+    /** One line of a plan, such as "NAME: Sky Calc". */
+    fun field(text: String, key: String): String? =
+        Regex("(?im)^\\s*" + Regex.escape(key) + "\\s*:\\s*(.+?)\\s*$").find(text)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
+
+    /** READY, ASK or CANCEL from the first line of a finalised plan. */
+    fun status(text: String): String? =
+        Regex("(?im)^\\s*STATUS:\\s*(READY|ASK|CANCEL)\\b").find(text)?.groupValues?.get(1)?.uppercase()
+
+    private val phaseRe = Regex("(?im)^\\s*PHASE\\s*\\d+\\s*:\\s*.+$")
+    fun parsePhases(text: String): List<String> = phaseRe.findAll(text).map { it.value.trim() }.toList().take(6)
+
+    private val planLineRe = Regex("(?im)^\\s*(GOAL|NAME|ICON|DESIGN|SCREENS|FEATURES|NOTES|PHASE\\s*\\d+)\\s*:.*$")
+    /** Only the plan lines of a reply, without greetings or questions. */
+    fun planLines(text: String): String = planLineRe.findAll(text).joinToString("\n") { it.value.trim() }
+
+    /** "Sky Calc (or Pocket Math)" becomes "Sky Calc". */
+    fun cleanName(raw: String): String =
+        raw.substringBefore('(').substringBefore('|').substringBefore('/').trim().trim('"', '“', '”', '\'', '`', '*').trim().take(28)
+
+    /** The first memory of a project is made from its final plan. */
+    fun memoryFromPlan(plan: String, bengali: Boolean): String = buildString {
+        listOf("GOAL" to "GOAL", "NAME" to "NAME", "ICON" to "ICON", "DESIGN" to "DESIGN", "FEATURES" to "FEATURES", "NOTES" to "DECISIONS").forEach { (k, label) ->
+            field(plan, k)?.let { append(label).append(": ").append(it).append('\n') }
+        }
+        append("USER: ").append(if (bengali) "writes Bengali and expects Bengali replies" else "writes English")
+    }.take(1200)
+
+    private fun norm(t: String) = t.replace(Regex("(?i)^\\s*phase\\s*\\d+\\s*:\\s*"), "").lowercase().replace(Regex("\\s+"), " ").trim()
+
+    /** A changed plan keeps the phases that are already done. */
+    fun mergeRoadmap(old: List<Task>, phases: List<String>): List<Task> {
+        val done = old.filter { it.state == TaskState.DONE }.map { norm(it.title) }.toSet()
+        return phases.map { Task(it, if (norm(it) in done) TaskState.DONE else TaskState.TODO) }
+    }
+
+    private val sectionRe = Regex("(?im)^\\s*(COMMIT|SUMMARY|MEMORY|PLAN):\\s*")
 
     /** Splits "COMMIT: ... SUMMARY: ... MEMORY: ..." into its parts (keys in capitals). */
     fun sections(text: String): Map<String, String> {
@@ -116,15 +163,15 @@ object BrainOps {
     }
 }
 
-enum class Intent { ACT, ANSWER }
+enum class Intent { ACT, ANSWER, ASK }
 
 /** Rules that decide, before and after the AI answers, whether the user wants work done or just an answer. */
 object Intents {
-    private val intentRe = Regex("(?im)^\\s*INTENT:\\s*(ACT|ANSWER)\\b")
+    private val intentRe = Regex("(?im)^\\s*INTENT:\\s*(ACT|ANSWER|ASK)\\b")
     private val controlRe = Regex("(?im)^\\s*(?:INTENT|FILE|DELETE|READ|APP_NAME)\\s*:.*(?:\\r?\\n|$)")
     private val summaryLabel = Regex("(?im)^\\s*SUMMARY:\\s*")
 
-    fun parseLine(text: String): Intent? = intentRe.find(text)?.let { if (it.groupValues[1].uppercase() == "ACT") Intent.ACT else Intent.ANSWER }
+    fun parseLine(text: String): Intent? = intentRe.find(text)?.let { when (it.groupValues[1].uppercase()) { "ACT" -> Intent.ACT; "ASK" -> Intent.ASK; else -> Intent.ANSWER } }
 
     /** The answer without the machine lines. */
     fun stripControl(text: String): String = summaryLabel.replace(controlRe.replace(text, ""), "").trim()

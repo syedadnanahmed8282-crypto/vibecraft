@@ -248,8 +248,15 @@ private fun NotesView(vm: AppVm, projectId: String?) {
     if (brain.brief.isNotBlank()) {
         Spacer(Modifier.height(12.dp))
         VcCard {
-            CardTitle(Ic.File, "Approved plan")
+            CardTitle(Ic.File, if (brain.planState == "draft") "Draft plan, waiting for you" else "Approved plan")
             Text(brain.brief, color = c.tx, fontSize = 12.5.sp, lineHeight = 18.sp)
+        }
+    }
+    brain.pending?.let { pd ->
+        Spacer(Modifier.height(12.dp))
+        VcCard {
+            CardTitle(Ic.Alert, "Waiting for your answer")
+            Text(pd.question, color = c.tx, fontSize = 12.5.sp, lineHeight = 18.sp)
         }
     }
     val steps = brain.roadmap + brain.tasks

@@ -2,7 +2,10 @@ package com.vibecraft.app.ui
 
 import android.content.Intent
 import android.net.Uri
+import android.Manifest
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
@@ -87,6 +90,15 @@ fun MainShell(vm: AppVm) {
             page != null -> page = null
             else -> drawer = false
         }
+    }
+    // Notifications: ask once, in our own words, before Android asks.
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.onNotifyPermissionResult(it) }
+    if (vm.askNotifyPermission) {
+        NotifyPrompt(onAllow = { permLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }, onLater = { vm.declineNotifyPrompt() })
+    }
+    // A tapped notification opens the chat it is about.
+    LaunchedEffect(vm.openRequest) {
+        vm.openRequest?.let { openId = it; page = null; drawer = false; menu = null; pillOpen = false; vm.openRequest = null }
     }
     fun go(p: String, tab: Int = 0) { menu = null; pillOpen = false; codeTab = tab; page = p }
     fun openSettings(sec: String) { menu = null; pillOpen = false; page = null; section = sec; drawer = true }

@@ -60,6 +60,7 @@ object Ic {
     val Clock = ic("clock", "M20 13a8 8 0 1 1 -16 0 8 8 0 0 1 16 0z", "M12 9v4l3 2", "M9 3h6")
     val Gauge = ic("gauge", "M4 18a8 8 0 1 1 16 0", "M12 18l4 -6")
     val Alert = ic("alert", "M12 8v5", "M12 17h.01", "M10.3 3.9L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7 -3L13.7 3.9a2 2 0 0 0 -3.4 0z")
+    val Bell = ic("bell", "M18 8a6 6 0 0 0 -12 0c0 7 -3 9 -3 9h18s-3 -2 -3 -9z", "M13.7 21a2 2 0 0 1 -3.4 0")
     val Copy = ic("copy", "M8 8h11v12H8z", "M5 16V4h11")
     val Reply = ic("reply", "M9 14L4 9l5 -5", "M4 9h10a6 6 0 0 1 6 6v2")
 }
